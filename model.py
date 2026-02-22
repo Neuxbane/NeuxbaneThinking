@@ -186,6 +186,10 @@ class NeuxbaneThinking(nn.Module):
             layer_outputs = layer(hidden_states, cache_params=cache_params, cache_position=cache_position)
             hidden_states = layer_outputs[0].to(dtype)
             
+            # Ensure 3D: [Batch, Seq, Hidden]
+            if hidden_states.dim() == 2:
+                hidden_states = hidden_states.unsqueeze(0)
+
             # 4. Rope Interaction
             combined_retrieval = torch.zeros_like(hidden_states)
             new_memories = []
@@ -200,11 +204,10 @@ class NeuxbaneThinking(nn.Module):
                     sp_weight = routing_weights[:, :, j].unsqueeze(-1) # [B, S, 1]
                     specialist = self.specialist_grid[i][f"rope_{j}"]
                     
-                    # Ensure alignment of B, S dimensions in case Mamba layer swapped them
-                    if hidden_states.shape[0] != memory.shape[0]:
+                    # Some Mamba versions might return [S, B, H] - rarely, but for robustness:
+                    target_hs = hidden_states
+                    if hidden_states.shape[0] != memory.shape[0] and hidden_states.dim() == 3:
                         target_hs = hidden_states.transpose(0, 1)
-                    else:
-                        target_hs = hidden_states
 
                     if self.training and self._is_gradient_checkpointing:
                         h_out, m_out = torch.utils.checkpoint.checkpoint(
@@ -213,12 +216,12 @@ class NeuxbaneThinking(nn.Module):
                     else:
                         h_out, m_out = specialist(target_hs, rope_memory, weight=sp_weight)
                     
-                    # Combine retrieval. Note that h_out and hidden_states must have same shape.
-                    # If we transposed, h_out will have different shape than hidden_states.
-                    if hidden_states.shape[0] != memory.shape[0]:
-                        combined_retrieval = combined_retrieval + (sp_weight * (h_out - target_hs)).transpose(0, 1)
+                    # Combine retrieval. Note that h_out and target_hs have same shape [B, S, H].
+                    delta = sp_weight * (h_out - target_hs)
+                    if hidden_states.shape[0] != memory.shape[0] and hidden_states.dim() == 3:
+                        combined_retrieval = combined_retrieval + delta.transpose(0, 1)
                     else:
-                        combined_retrieval = combined_retrieval + sp_weight * (h_out - hidden_states)
+                        combined_retrieval = combined_retrieval + delta
                     new_memories.append(m_out)
                 else:
                     new_memories.append(rope_memory)
