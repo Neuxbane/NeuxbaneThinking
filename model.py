@@ -51,7 +51,16 @@ class Q4_0Linear(nn.Module):
 
     def forward(self, x):
         w = self.get_quantized_weight()
-        return torch.nn.functional.linear(x, w.to(x.dtype), self.bias)
+        # Ensure device and dtype match for robustness, especially during JIT offload re-runs
+        device = x.device
+        dtype = x.dtype
+        
+        # We must also ensure self.bias is on the right device if it exists
+        bias = self.bias
+        if bias is not None:
+            bias = bias.to(device=device, dtype=dtype)
+            
+        return torch.nn.functional.linear(x, w.to(device=device, dtype=dtype), bias)
 
 class BPETokenizer:
     def __init__(self, model_id: str = "openai-community/gpt2"):
@@ -97,6 +106,13 @@ class DynamicScratchpad(nn.Module):
         # x: [batch, (seq_len), hidden_size]
         # memory: [batch, num_pads, hidden_size]
         
+        # JIT Safety: Ensure module is on same device as input.
+        # This is critical for Gradient Checkpointing re-computations that occur 
+        # after the forward pass has already offloaded these experts to CPU.
+        device = x.device
+        if self.in_proj.weight.device != device:
+            self.to(device)
+            
         # Consistent 3D handling
         was_2d = False
         if x.dim() == 2:
@@ -110,8 +126,10 @@ class DynamicScratchpad(nn.Module):
         projs = self.in_proj(x)
         q, u, f = torch.split(projs, self.rank, dim=-1)
         
-        # Project memory to rank space for retrieval and update
-        memory_rank = memory @ self.in_proj.weight[:self.rank].T # [B, Pads, Rank]
+        # Quantized weight for memory projection
+        # We must use get_quantized_weight to maintain q4_0 logic everywhere
+        w_quant = self.in_proj.get_quantized_weight()
+        memory_rank = memory @ w_quant[:self.rank].T # [B, Pads, Rank]
 
         # Attention over memory pads
         sim = torch.matmul(q, memory_rank.transpose(-1, -2)) # [B, S, Pads]
@@ -142,6 +160,7 @@ class DynamicScratchpad(nn.Module):
         memory = self.out_proj(memory_rank)
         
         # Evolution & Diffusion
+        # Ensure diffusion_kernel and other parameters are correctly matched
         memory = torch.matmul(self.diffusion_kernel, memory)
         memory = memory + self.evolve_gate * self.evolve(memory)
         memory = self.mem_norm(memory)
@@ -289,6 +308,11 @@ class NeuxbaneThinking(nn.Module):
             # Identify which ropes are active in the entire batch for optimization
             active_ropes = torch.any(routing_weights > 0, dim=(0, 1))
 
+            # --- JIT Fast Fetch: Fetch all active ropes for this layer in one batch ---
+            for j in range(self.num_ropes):
+                if active_ropes[j]:
+                    self.specialist_grid[i][f"rope_{j}"].to(device, non_blocking=True)
+
             for j in range(self.num_ropes):
                 rope_memory = memory[:, j]
                 
@@ -296,10 +320,11 @@ class NeuxbaneThinking(nn.Module):
                     sp_weight = routing_weights[:, :, j].unsqueeze(-1) # [B, S, 1]
                     specialist = self.specialist_grid[i][f"rope_{j}"]
                     
-                    # JIT FETCHER: Move expert to GPU RAM only when needed
-                    specialist.to(device)
+                    # Ensure it's on the right device (non_blocking might still be finishing)
+                    # Use a dummy parameter to ensure device sync if needed
+                    # specialist.to(device) 
                     
-                    # Some Mamba versions might return [S, B, H] - rarely, but for robustness:
+                    # Target computation
                     target_hs = hidden_states
                     if hidden_states.shape[0] != memory.shape[0] and hidden_states.dim() == 3:
                         target_hs = hidden_states.transpose(0, 1)
@@ -311,25 +336,20 @@ class NeuxbaneThinking(nn.Module):
                     else:
                         h_out, m_out = specialist(target_hs, rope_memory, weight=sp_weight)
                     
-                    # Combine retrieval. Note that h_out and target_hs have same shape [B, S, H].
+                    # Combine retrieval
                     delta = sp_weight * (h_out - target_hs)
                     if hidden_states.shape[0] != memory.shape[0] and hidden_states.dim() == 3:
                         combined_retrieval = combined_retrieval + delta.transpose(0, 1)
                     else:
                         combined_retrieval = combined_retrieval + delta
                     new_memories.append(m_out)
-                    
-                    # Optional: Offload back to CPU to save GPU RAM if not training
-                    # or if we want aggressive RAM management even during training.
-                    # For now, let's keep it simple: always fetch JIT, 
-                    # and offload at the end of the layer loop for maximum RAM efficiency.
                 else:
                     new_memories.append(rope_memory)
             
-            # Post-Layer Offload: Move specialists back to CPU RAM
+            # --- JIT Post-Layer Offload: Move specialists back to CPU RAM ---
             for j in range(self.num_ropes):
                 if active_ropes[j]:
-                    self.specialist_grid[i][f"rope_{j}"].to("cpu")
+                    self.specialist_grid[i][f"rope_{j}"].to("cpu", non_blocking=True)
             
             # All ropes move to next layer
             memory = torch.stack(new_memories, dim=1)
