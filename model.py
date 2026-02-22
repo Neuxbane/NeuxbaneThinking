@@ -25,7 +25,7 @@ class BPETokenizer:
         return self.tokenizer.decode(token_ids)
 
 class DynamicScratchpad(nn.Module):
-    def __init__(self, hidden_size: int, num_pads: int = 256, rank: int = 32):
+    def __init__(self, hidden_size: int, num_pads: int = 128, rank: int = 32):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_pads = num_pads
@@ -111,17 +111,28 @@ class NeuxbaneThinking(nn.Module):
         if model_id_or_path:
             self.base_model = MambaForCausalLM.from_pretrained(model_id_or_path, torch_dtype=torch.bfloat16, device_map="auto")
         else:
-            config = MambaConfig(vocab_size=50260, hidden_size=768, state_size=16, num_hidden_layers=9, expand=2, conv_kernel=4, use_cache=True, rms_norm_eps=1e-5, torch_dtype=torch.bfloat16)
+            # 1B-Base Mamba Config (Standard is ~48 layers, here 32 layers x 2048 hidden leads to ~1B)
+            config = MambaConfig(
+                vocab_size=50260, 
+                hidden_size=2048, 
+                state_size=16, 
+                num_hidden_layers=32, 
+                expand=2, 
+                conv_kernel=4, 
+                use_cache=True, 
+                rms_norm_eps=1e-5, 
+                torch_dtype=torch.bfloat16
+            )
             self.base_model = MambaForCausalLM(config)
         self.config = self.base_model.config
         self.hidden_size = self.config.hidden_size
         self.num_layers = self.config.num_hidden_layers
-        self.num_ropes = 8
+        self.num_ropes = 4 # Total specialists = 32 layers * 4 ropes = 128
         
-        # Specialist Grid: 9 Layers x 8 Ropes
+        # Specialist Grid: num_layers x num_ropes
         self.specialist_grid = nn.ModuleList([
             nn.ModuleDict({
-                f"rope_{j}": DynamicScratchpad(self.hidden_size) for j in range(self.num_ropes)
+                f"rope_{j}": DynamicScratchpad(self.hidden_size, num_pads=128) for j in range(self.num_ropes)
             }) for i in range(self.num_layers)
         ])
         
@@ -129,7 +140,7 @@ class NeuxbaneThinking(nn.Module):
         self.routers = nn.ModuleList([nn.Linear(self.hidden_size, self.num_ropes) for _ in range(self.num_layers)])
         
         # Per-rope initial memory
-        self.rope_init = nn.Parameter(torch.zeros(self.num_ropes, 256, self.hidden_size))
+        self.rope_init = nn.Parameter(torch.zeros(self.num_ropes, 128, self.hidden_size))
         
         self.load_specialists()
         # Default to bfloat16 for initial weights
@@ -144,7 +155,11 @@ class NeuxbaneThinking(nn.Module):
             for j in range(self.num_ropes):
                 path = os.path.join(sp_dir, f"L{i}_R{j}.pth")
                 if os.path.exists(path):
-                    self.specialist_grid[i][f"rope_{j}"].load_state_dict(torch.load(path, map_location="cpu"), strict=False)
+                    try:
+                        state_dict = torch.load(path, map_location="cpu", weights_only=True)
+                        self.specialist_grid[i][f"rope_{j}"].load_state_dict(state_dict, strict=True)
+                    except Exception as e:
+                        print(f"Skipping specialist L{i}_R{j} due to loading error (likely shape mismatch): {e}")
 
     def save_specialists(self):
         sp_dir = os.path.join(self.checkpoint_dir, "scratchpads")
