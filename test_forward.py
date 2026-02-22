@@ -2,18 +2,17 @@ import torch
 from model import NeuxbaneThinking, BPETokenizer
 
 def test_model():
-    device = "cpu"
+    device = "cuda:1" if torch.cuda.is_available() else "cpu"
     tokenizer = BPETokenizer()
     model = NeuxbaneThinking()
-    # model.to(device).to(torch.bfloat16 if device == "cuda" else torch.float32)
+    model.to(device).to(torch.bfloat16 if "cuda" in str(device) else torch.float32)
     model.eval()
     
     text = "Hello world"
     tokens = tokenizer.encode(text)
     input_ids = torch.LongTensor(tokens).unsqueeze(0).to(device)
     
-    # Force base model and all modules to bfloat16
-    model = model.to(torch.bfloat16)
+    # model = model.to(torch.bfloat16) # handled above
 
     print(f"Testing forward pass on {device}...")
     try:

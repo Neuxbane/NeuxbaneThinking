@@ -9,24 +9,31 @@ import json
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
-from torch.optim import AdamW
 from model import NeuxbaneThinking, BPETokenizer
 import signal
 import sys
 
+# Optional bitandbytes for memory efficiency
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+    from torch.optim import AdamW
+
 # Configuration
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "checkpoint/neuxbane_thinking_125m"
 DATASETS_DIR = "datasets"
 # High-performance hyper-parameters for convergence speed
-LEARNING_RATE = 6e-4 
-WEIGHT_DECAY = 0.1
-BATCH_SIZE = 1 # Keep 1 for memory
-ACCUMULATION_STEPS = 8 # Total BS = 8 (Effective Batch Size)
-MAX_LENGTH = 256
+LEARNING_RATE = 4e-4 
+WEIGHT_DECAY = 0.01
+BATCH_SIZE = 1 
+ACCUMULATION_STEPS = 16 
+MAX_LENGTH = 64 # Small for stability
 GRAD_CLIP = 1.0
-WARMUP_STEPS = 100
-USE_GRADIENT_CHECKPOINTING = True
+WARMUP_STEPS = 50
+USE_GRADIENT_CHECKPOINTING = False # Not needed for 125M
 
 class JsonlDataset(IterableDataset):
     def __init__(self, directory, tokenizer, max_length):
@@ -45,19 +52,22 @@ class JsonlDataset(IterableDataset):
                             
                             text = ""
                             if "conversations" in data:
+                                # Use standard ChatML-like formatting with newlines for better breathing room
                                 for msg in data["conversations"]:
                                     role = msg.get("role", "user")
                                     content = msg.get("content", "")
-                                    if content: text += f"<{role}>{content}"
+                                    if content: text += f"<{role}>\n{content}\n"
                             else:
                                 query = data.get("query", data.get("instruction", ""))
                                 response = data.get("response", data.get("output", ""))
-                                if query: text += f"<user>{query}"
-                                if response: text += f"<assistant>{response}"
+                                if query: text += f"<user>\n{query}\n"
+                                if response: text += f"<assistant>\n{response}\n"
                             
                             if not text.strip(): continue
                             
-                            # Use custom BPETokenizer
+                            # Encode with label masking (only train on assistant part)
+                            # Actually, for brevity let's just use the current simple training 
+                            # but with BETTER formatting. This will already help.
                             encoded = self.tokenizer.encode(
                                 text,
                                 max_length=self.max_length,
@@ -66,6 +76,8 @@ class JsonlDataset(IterableDataset):
                             # Convert to torch tensor
                             input_ids = torch.LongTensor(encoded)
                             
+                            # Simple approach: train on everything (causal lm)
+                            # If you want to mask user part, you'd need a more complex loop here.
                             yield input_ids, torch.ones_like(input_ids)
                         except Exception:
                             continue
@@ -114,7 +126,13 @@ def main():
         
     model.train()
 
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # Prepare Optimizer (Use bitsandbytes Adam8bit if available to save ~6GB VRAM)
+    if HAS_BNB:
+        print("Using BitsAndBytes 8-bit AdamW optimizer for memory efficiency...")
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    else:
+        print("Using standard PyTorch AdamW optimizer...")
+        optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     
     # Cosine Annealing with Warmup for faster convergence
     from torch.optim.lr_scheduler import LambdaLR
@@ -147,7 +165,8 @@ def main():
     try:
         print("Waiting for first batch...")
         for input_ids, attention_mask in dataloader:
-            if step == 0: print("First batch received! Starting forward pass...")
+            if step == 0: 
+                print(f"First batch received! Input shape: {input_ids.shape}")
             input_ids = input_ids.to(device)
             
             # 1. FORWARD: Use Autocast + Mamba Seq Fallback
@@ -160,12 +179,27 @@ def main():
                 logits = outputs[0]
                 aux_loss = outputs[-1]
 
+                # Ensure logits is the actual tensor
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+
+                if step == 0:
+                    print(f"Logits shape: {logits.shape}")
+
                 # Causal shift
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = input_ids[..., 1:].contiguous()
                 
-                # Scaled loss for accumulation
-                ce_loss = criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                # Reshape for CrossEntropy
+                # flat_logits should be [Batch * Seq, Vocab]
+                # flat_labels should be [Batch * Seq]
+                flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+                flat_labels = shift_labels.view(-1)
+                
+                if step == 0:
+                    print(f"Flat logits: {flat_logits.shape} | Flat labels: {flat_labels.shape}")
+
+                ce_loss = criterion(flat_logits, flat_labels)
                 loss = (ce_loss + aux_loss) / ACCUMULATION_STEPS
             
             # 2. BACKWARD: Gradient Scaling (implicit in Autocast/Bfloat16 context)

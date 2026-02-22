@@ -44,7 +44,8 @@ def main():
             prompt = input("User> ").strip()
             if not prompt: continue
             
-            # Format prompt with special tags
+            # Format prompt with the new training format (includes newlines)
+            # This helps the model distinguish roles better.
             formatted_prompt = f"<user>\n{prompt}\n<assistant>\n"
             
             # Encode
@@ -60,14 +61,13 @@ def main():
             
             with torch.no_grad():
                 for i in range(MAX_NEW_TOKENS):
-                    # On the first step, we pass the full prompt. Subsequently, only the last token.
-                    current_input = input_ids if i == 0 else next_token
-                    
-                    logits, cache_params, memory = model(
-                        input_ids=current_input,
-                        cache_params=cache_params,
+                    # Temporary disable KV cache to bypass transformers' Mamba slow_forward bug
+                    # We pass the full history (generated_ids) every time.
+                    # This is slower but stable.
+                    logits, _, memory, _ = model(
+                        input_ids=generated_ids,
                         memory=memory,
-                        use_cache=True
+                        use_cache=False
                     )
                     
                     # Selection logic

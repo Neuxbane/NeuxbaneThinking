@@ -1,0 +1,45 @@
+The fast path is not available because one of `(selective_state_update, selective_scan_fn, causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)` is None. Falling back to the sequential implementation of Mamba, as use_mambapy is set to False. To install follow https://github.com/state-spaces/mamba/#installation and https://github.com/Dao-AILab/causal-conv1d. For the mamba.py backend, follow https://github.com/alxndrTL/mamba.py.
+Traceback (most recent call last):
+  File "/home/jupyter-240712834/research/NeuxbaneThinking/train.py", line 155, in main
+    outputs = model(
+        input_ids=input_ids,
+        memory=None,
+        use_cache=False
+    )
+  File "/home/jupyter-240712834/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/jupyter-240712834/miniconda3/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/jupyter-240712834/research/NeuxbaneThinking/model.py", line 261, in forward
+    hidden_states, memory, layer_aux = torch.utils.checkpoint.checkpoint(
+                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self._forward_layer, i, hidden_states, memory, cache_params, cache_position,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        use_reentrant=False
+        ^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/jupyter-240712834/miniconda3/lib/python3.13/site-packages/torch/_compile.py", line 53, in inner
+    return disable_fn(*args, **kwargs)
+  File "/home/jupyter-240712834/miniconda3/lib/python3.13/site-packages/torch/_dynamo/eval_frame.py", line 1044, in _fn
+    return fn(*args, **kwargs)
+  File "/home/jupyter-240712834/miniconda3/lib/python3.13/site-packages/torch/utils/checkpoint.py", line 503, in checkpoint
+    ret = function(*args, **kwargs)
+  File "/home/jupyter-240712834/research/NeuxbaneThinking/model.py", line 221, in _forward_layer
+    sp_weight = routing_weights[:, :, j].unsqueeze(-1)
+                ~~~~~~~~~~~~~~~^^^^^^^^^
+IndexError: too many indices for tensor of dimension 2
+Using device: cuda:1
+Loaded 128 specialists from checkpoint/specialists.pt
+Enabling Gradient Checkpointing for VRAM safety...
+Loading base Mamba weights from checkpoint/neuxbane_thinking_125m.pth...
+Loading existing optimizer state from checkpoint/neuxbane_thinking_125m_opt.pth
+Dataset files: 1
+Starting infinite training... Press Ctrl+C to stop and save.
+Waiting for first batch...
+First batch received! Starting forward pass...
+An unexpected error occurred: too many indices for tensor of dimension 2
+Saved 128 specialists to checkpoint/specialists.pt
+
+Checkpoint saved: checkpoint/neuxbane_thinking_125m (Mamba base + Specialist directory)
