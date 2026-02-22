@@ -9,58 +9,112 @@ from typing import Optional, Tuple, Union, List, Any
 # --- Q4_0 Quantization Support ---
 
 class Q4_0Linear(nn.Module):
-    """
-    Implements q4_0-style 4-bit quantization with block-wise scales.
-    Supports differentiable training via Straight-Through Estimator (STE).
-    """
+    # ... (existing Q4_0Linear implementation) ...
     def __init__(self, in_features, out_features, bias=False, block_size=32):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = block_size
         
-        # Master weight in bfloat16. We use quantization in the forward pass.
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter("bias", None)
         
-        # Initialize
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
 
     def get_quantized_weight(self):
-        # Differentiable quantization via STE
         w = self.weight
         out_f, in_f = w.shape
-        # Ensure divisible by block_size
-        if in_f % self.block_size != 0:
-            return w # Fallback if shape is weird
-            
+        if in_f % self.block_size != 0: return w
         w_reshaped = w.view(out_f, -1, self.block_size)
-        
-        # Block-wise scales
         scales = w_reshaped.abs().max(dim=-1, keepdim=True).values / 7.0
-        # Quantize to [-8, 7]
         q = torch.round(w_reshaped / (scales + 1e-6)).clamp(-8, 7)
-        # Dequantize
         w_dequant = (q * scales).view(out_f, in_f)
-        
-        # Straight-Through Estimator: w_dequant in forward, grad(w) in backward
         return w + (w_dequant - w).detach()
 
     def forward(self, x):
         w = self.get_quantized_weight()
-        # Ensure device and dtype match for robustness, especially during JIT offload re-runs
-        device = x.device
-        dtype = x.dtype
-        
-        # We must also ensure self.bias is on the right device if it exists
-        bias = self.bias
-        if bias is not None:
-            bias = bias.to(device=device, dtype=dtype)
-            
+        device, dtype = x.device, x.dtype
+        bias = self.bias.to(device=device, dtype=dtype) if self.bias is not None else None
         return torch.nn.functional.linear(x, w.to(device=device, dtype=dtype), bias)
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))
+
+    def forward(self, x):
+        norm = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(norm + self.eps) * self.weight
+
+class DynamicScratchpad(nn.Module):
+    def __init__(self, hidden_size: int, num_pads: int = 128, rank: int = 32):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_pads = num_pads
+        self.rank = rank
+        
+        # Rank-Space Projections
+        self.in_proj = Q4_0Linear(hidden_size, rank * 3, bias=False) # Q, U, F
+        self.out_proj = Q4_0Linear(rank, hidden_size, bias=False)
+        
+        self.gate = nn.Parameter(torch.zeros(1))
+        
+        # Evolution happens in Rank-Space (High Efficiency)
+        self.evolve = nn.Sequential(
+            Q4_0Linear(rank, rank, bias=False),
+            nn.GELU(),
+            Q4_0Linear(rank, rank, bias=False)
+        )
+        self.evolve_gate = nn.Parameter(torch.zeros(1))
+        self.diffusion_kernel = nn.Parameter(torch.eye(num_pads))
+        self.mem_norm = RMSNorm(rank)
+
+    def forward(self, x: torch.Tensor, memory_rank: torch.Tensor, weight: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # memory_rank: [batch, num_pads, rank]
+        device = x.device
+        if self.in_proj.weight.device != device:
+            self.to(device)
+            
+        was_2d = False
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            was_2d = True
+            
+        # 1. Retrieval (All in Rank-Space)
+        projs = self.in_proj(x)
+        q, u, f = torch.split(projs, self.rank, dim=-1)
+        
+        # Cross-attention in low-rank
+        sim = torch.matmul(q, memory_rank.transpose(-1, -2)) # [B, S, Pads]
+        attn = torch.softmax(sim / (self.rank**0.5), dim=-1)
+        
+        retrieved_rank = torch.matmul(attn, memory_rank) # [B, S, Rank]
+        retrieved = self.out_proj(retrieved_rank)
+        x_out = x + self.gate * retrieved
+        
+        # 2. Update (All in Rank-Space)
+        f_gate = torch.sigmoid(f)
+        if weight is not None:
+             u = u * weight
+             f_gate = f_gate * weight
+             
+        u_pads = torch.matmul(attn.transpose(-1, -2), u)
+        f_pads = torch.matmul(attn.transpose(-1, -2), f_gate)
+        
+        # Direct rank-space update eliminates Hidden matmuls
+        memory_rank = memory_rank * (1.0 - f_pads.clamp(0, 1)) + u_pads
+        
+        # Evolution & Diffusion in rank-space
+        memory_rank = torch.matmul(self.diffusion_kernel, memory_rank)
+        memory_rank = memory_rank + self.evolve_gate * self.evolve(memory_rank)
+        memory_rank = self.mem_norm(memory_rank)
+        
+        if was_2d: x_out = x_out.squeeze(1)
+        return x_out, memory_rank
 
 class BPETokenizer:
     def __init__(self, model_id: str = "openai-community/gpt2"):
@@ -92,83 +146,59 @@ class DynamicScratchpad(nn.Module):
         self.out_proj = Q4_0Linear(rank, hidden_size, bias=False)
         
         self.gate = nn.Parameter(torch.zeros(1))
-        # Lightweight evolution via Q4_0Linear
+        
+        # Evolution happens in Rank-Space (High Efficiency)
         self.evolve = nn.Sequential(
-            Q4_0Linear(hidden_size, rank, bias=False),
+            Q4_0Linear(rank, rank, bias=False),
             nn.GELU(),
-            Q4_0Linear(rank, hidden_size, bias=False)
+            Q4_0Linear(rank, rank, bias=False)
         )
         self.evolve_gate = nn.Parameter(torch.zeros(1))
         self.diffusion_kernel = nn.Parameter(torch.eye(num_pads))
-        self.mem_norm = nn.LayerNorm(hidden_size)
+        self.mem_norm = RMSNorm(rank)
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor, weight: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        # x: [batch, (seq_len), hidden_size]
-        # memory: [batch, num_pads, hidden_size]
-        
-        # JIT Safety: Ensure module is on same device as input.
-        # This is critical for Gradient Checkpointing re-computations that occur 
-        # after the forward pass has already offloaded these experts to CPU.
+    def forward(self, x: torch.Tensor, memory_rank: torch.Tensor, weight: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # memory_rank: [batch, num_pads, rank]
         device = x.device
         if self.in_proj.weight.device != device:
             self.to(device)
             
-        # Consistent 3D handling
         was_2d = False
         if x.dim() == 2:
             x = x.unsqueeze(1)
             was_2d = True
             
-        batch, seq, _ = x.shape
-        x_dtype = x.dtype
-        
-        # Projections via bottleneck
+        # 1. Retrieval (All in Rank-Space)
         projs = self.in_proj(x)
         q, u, f = torch.split(projs, self.rank, dim=-1)
         
-        # Quantized weight for memory projection
-        # We must use get_quantized_weight to maintain q4_0 logic everywhere
-        w_quant = self.in_proj.get_quantized_weight()
-        memory_rank = memory @ w_quant[:self.rank].T # [B, Pads, Rank]
-
-        # Attention over memory pads
+        # Cross-attention in low-rank
         sim = torch.matmul(q, memory_rank.transpose(-1, -2)) # [B, S, Pads]
         attn = torch.softmax(sim / (self.rank**0.5), dim=-1)
         
-        # Retrieval
         retrieved_rank = torch.matmul(attn, memory_rank) # [B, S, Rank]
         retrieved = self.out_proj(retrieved_rank)
         x_out = x + self.gate * retrieved
         
-        # Update Logic
+        # 2. Update (All in Rank-Space)
         f_gate = torch.sigmoid(f)
-        
-        # Specialists interaction weight
         if weight is not None:
              u = u * weight
              f_gate = f_gate * weight
              
-        # Causal scan for memory is too slow during training, so we use a weighted-average update
-        # for tokens in the same sequence.
-        # attn: [B, S, Pads], u: [B, S, Rank]
-        # We want u_pads: [B, Pads, Rank]
         u_pads = torch.matmul(attn.transpose(-1, -2), u)
         f_pads = torch.matmul(attn.transpose(-1, -2), f_gate)
         
-        # Update memory in rank space
+        # Direct rank-space update eliminates Hidden matmuls
         memory_rank = memory_rank * (1.0 - f_pads.clamp(0, 1)) + u_pads
-        memory = self.out_proj(memory_rank)
         
-        # Evolution & Diffusion
-        # Ensure diffusion_kernel and other parameters are correctly matched
-        memory = torch.matmul(self.diffusion_kernel, memory)
-        memory = memory + self.evolve_gate * self.evolve(memory)
-        memory = self.mem_norm(memory)
+        # Evolution & Diffusion in rank-space
+        memory_rank = torch.matmul(self.diffusion_kernel, memory_rank)
+        memory_rank = memory_rank + self.evolve_gate * self.evolve(memory_rank)
+        memory_rank = self.mem_norm(memory_rank)
         
-        if was_2d:
-            x_out = x_out.squeeze(1)
-            
-        return x_out, memory
+        if was_2d: x_out = x_out.squeeze(1)
+        return x_out, memory_rank
 
 class NeuxbaneThinking(nn.Module):
     def __init__(self, model_id_or_path: Optional[str] = None, checkpoint_dir: str = "checkpoint"):
@@ -205,8 +235,8 @@ class NeuxbaneThinking(nn.Module):
         # Routers: One per layer deciding which "rope" to pull
         self.routers = nn.ModuleList([nn.Linear(self.hidden_size, self.num_ropes) for _ in range(self.num_layers)])
         
-        # Per-rope initial memory
-        self.rope_init = nn.Parameter(torch.zeros(self.num_ropes, 128, self.hidden_size))
+        # Per-rope initial memory in Rank-Space
+        self.rope_init = nn.Parameter(torch.zeros(self.num_ropes, 128, 32)) # Rank=32
         
         self.load_specialists()
         # Default to bfloat16 for initial weights
@@ -224,7 +254,6 @@ class NeuxbaneThinking(nn.Module):
 
     def to(self, *args, **kwargs):
         """Override to ensure specialists stay on CPU while base model moves to GPU."""
-        # Detect target dtype if any
         target_dtype = None
         for arg in args:
             if isinstance(arg, torch.dtype): target_dtype = arg
@@ -235,7 +264,6 @@ class NeuxbaneThinking(nn.Module):
                 for rope in layer_ropes.values():
                     rope.to(dtype=target_dtype)
 
-        # Hide specialist_grid from standard .to() recursive call
         grid = self._modules.pop('specialist_grid')
         try:
             super().to(*args, **kwargs)
@@ -255,7 +283,7 @@ class NeuxbaneThinking(nn.Module):
                         state_dict = torch.load(path, map_location="cpu", weights_only=True)
                         self.specialist_grid[i][f"rope_{j}"].load_state_dict(state_dict, strict=True)
                     except Exception as e:
-                        print(f"Skipping specialist L{i}_R{j} due to loading error (likely shape mismatch): {e}")
+                        print(f"Skipping specialist L{i}_R{j} due to loading error: {e}")
 
     def save_specialists(self):
         sp_dir = os.path.join(self.checkpoint_dir, "scratchpads")
@@ -272,11 +300,13 @@ class NeuxbaneThinking(nn.Module):
         dtype = self.base_model.dtype
         device = input_ids.device
         
-        # memory: [batch, num_ropes, num_pads, hidden]
+        # memory: [batch, num_ropes, num_pads, rank]
         if memory is None:
             batch_size = input_ids.shape[0]
             memory = self.rope_init.unsqueeze(0).expand(batch_size, -1, -1, -1).to(device).to(dtype)
         
+        total_aux_loss = 0.0
+
         if cache_params is not None and cache_position is None:
             cache_position = torch.arange(input_ids.shape[1], device=device)
 
@@ -284,31 +314,38 @@ class NeuxbaneThinking(nn.Module):
         
         for i, layer in enumerate(self.base_model.backbone.layers):
             router = self.routers[i]
-            # 1. Causal Router selects Ropes
-            routing_weights = torch.softmax(router(hidden_states), dim=-1).to(dtype) # [B, S, 8]
             
-            # 2. Top-k Ropes (k=2)
+            # Causal Routing + Stability Losses
+            router_logits = router(hidden_states).to(torch.float32)
+            routing_weights = torch.softmax(router_logits, dim=-1).to(dtype) 
+            
+            # 1. Router Z-Loss (Stability)
+            z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1)**2)
+            
+            # 2. Auxiliary Load Balancing Loss
+            freqs = routing_weights.mean(dim=(0, 1))
+            probs = torch.softmax(router_logits.mean(dim=(0, 1)), dim=-1)
+            aux_loss = self.num_ropes * torch.sum(freqs * probs)
+            total_aux_loss = total_aux_loss + 0.01 * (z_loss * 0.1 + aux_loss)
+
+            # Top-k Ropes (k=2)
             top_k_val, top_k_idx = torch.topk(routing_weights, k=2, dim=-1)
             mask = torch.zeros_like(routing_weights).scatter_(-1, top_k_idx, 1.0)
             routing_weights = routing_weights * mask
             routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-6)
             
-            # 3. Mamba logic
+            # Mamba logic
             layer_outputs = layer(hidden_states, cache_params=cache_params, cache_position=cache_position)
             hidden_states = layer_outputs[0].to(dtype)
             
-            # Ensure 3D: [Batch, Seq, Hidden]
             if hidden_states.dim() == 2:
                 hidden_states = hidden_states.unsqueeze(0)
 
-            # 4. Rope Interaction
             combined_retrieval = torch.zeros_like(hidden_states)
             new_memories = []
-            
-            # Identify which ropes are active in the entire batch for optimization
             active_ropes = torch.any(routing_weights > 0, dim=(0, 1))
 
-            # --- JIT Fast Fetch: Fetch all active ropes for this layer in one batch ---
+            # Fetch active specialists for this layer
             for j in range(self.num_ropes):
                 if active_ropes[j]:
                     self.specialist_grid[i][f"rope_{j}"].to(device, non_blocking=True)
@@ -317,14 +354,9 @@ class NeuxbaneThinking(nn.Module):
                 rope_memory = memory[:, j]
                 
                 if active_ropes[j]:
-                    sp_weight = routing_weights[:, :, j].unsqueeze(-1) # [B, S, 1]
+                    sp_weight = routing_weights[:, :, j].unsqueeze(-1)
                     specialist = self.specialist_grid[i][f"rope_{j}"]
                     
-                    # Ensure it's on the right device (non_blocking might still be finishing)
-                    # Use a dummy parameter to ensure device sync if needed
-                    # specialist.to(device) 
-                    
-                    # Target computation
                     target_hs = hidden_states
                     if hidden_states.shape[0] != memory.shape[0] and hidden_states.dim() == 3:
                         target_hs = hidden_states.transpose(0, 1)
@@ -336,7 +368,6 @@ class NeuxbaneThinking(nn.Module):
                     else:
                         h_out, m_out = specialist(target_hs, rope_memory, weight=sp_weight)
                     
-                    # Combine retrieval
                     delta = sp_weight * (h_out - target_hs)
                     if hidden_states.shape[0] != memory.shape[0] and hidden_states.dim() == 3:
                         combined_retrieval = combined_retrieval + delta.transpose(0, 1)
@@ -346,27 +377,25 @@ class NeuxbaneThinking(nn.Module):
                 else:
                     new_memories.append(rope_memory)
             
-            # --- JIT Post-Layer Offload: Move specialists back to CPU RAM ---
+            # Post-Layer Offload
             for j in range(self.num_ropes):
                 if active_ropes[j]:
                     self.specialist_grid[i][f"rope_{j}"].to("cpu", non_blocking=True)
             
-            # All ropes move to next layer
             memory = torch.stack(new_memories, dim=1)
             hidden_states = (hidden_states + combined_retrieval).to(dtype)
         
         hidden_states = self.base_model.backbone.norm_f(hidden_states).to(dtype)
         logits = self.base_model.lm_head(hidden_states)
-        if return_hidden: return logits, hidden_states, cache_params, memory
-        return logits, cache_params, memory
+        
+        if return_hidden: return logits, hidden_states, cache_params, memory, total_aux_loss
+        return logits, cache_params, memory, total_aux_loss
 
     @torch.no_grad()
     def generate(self, input_ids, max_new_tokens=50, memory=None):
         generated = input_ids
         for i in range(max_new_tokens):
-            # Fallback to O(N^2) for stability with custom MoS logic
-            # This ensures correctness while we investigate MambaCache indexing
-            logits, _, memory = self.forward(generated, memory=memory, use_cache=False)
+            logits, _, memory, _ = self.forward(generated, memory=memory, use_cache=False)
             next_token = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(-1)
             generated = torch.cat([generated, next_token], dim=-1)
             if next_token.item() == self.config.eos_token_id: break

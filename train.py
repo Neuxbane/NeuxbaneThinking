@@ -158,18 +158,19 @@ def main():
                     use_cache=False
                 )
                 logits = outputs[0]
+                aux_loss = outputs[-1]
 
                 # Causal shift
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = input_ids[..., 1:].contiguous()
                 
                 # Scaled loss for accumulation
-                loss = criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                loss = loss / ACCUMULATION_STEPS
+                ce_loss = criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                loss = (ce_loss + aux_loss) / ACCUMULATION_STEPS
             
             # 2. BACKWARD: Gradient Scaling (implicit in Autocast/Bfloat16 context)
             loss.backward()
-            accumulated_loss += loss.item() * ACCUMULATION_STEPS
+            accumulated_loss += ce_loss.item() 
 
             # 3. OPTIMIZER STEP (Every N steps)
             if (step + 1) % ACCUMULATION_STEPS == 0:
@@ -178,7 +179,7 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 
-                print(f"Step: {step // ACCUMULATION_STEPS} | Avg Loss: {accumulated_loss / ACCUMULATION_STEPS:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+                print(f"Step: {step // ACCUMULATION_STEPS} | CE Loss: {accumulated_loss / ACCUMULATION_STEPS:.4f} | Aux: {aux_loss.item():.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
                 accumulated_loss = 0
                 
                 # Periodic cache clearing to avoid fragmentation
