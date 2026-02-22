@@ -134,6 +134,7 @@ class NeuxbaneThinking(nn.Module):
         self.load_specialists()
         # Default to bfloat16 for initial weights
         self.to(torch.bfloat16)
+        self._is_gradient_checkpointing = False
 
     def load_specialists(self):
         sp_dir = os.path.join(self.checkpoint_dir, "scratchpads")
@@ -154,6 +155,7 @@ class NeuxbaneThinking(nn.Module):
 
     def gradient_checkpointing_enable(self, **kwargs):
         self.base_model.gradient_checkpointing_enable(**kwargs)
+        self._is_gradient_checkpointing = True
 
     def forward(self, input_ids, memory=None, cache_params=None, return_hidden=False, use_cache=True, cache_position=None):
         dtype = self.base_model.dtype
@@ -198,7 +200,7 @@ class NeuxbaneThinking(nn.Module):
                     sp_weight = routing_weights[:, :, j].unsqueeze(-1) # [B, S, 1]
                     specialist = self.specialist_grid[i][f"rope_{j}"]
                     
-                    if self.training and self.base_model.config.gradient_checkpointing:
+                    if self.training and self._is_gradient_checkpointing:
                         # Use gradient checkpointing to save VRAM on sequential rope processing
                         h_out, m_out = torch.utils.checkpoint.checkpoint(
                             specialist, hidden_states, rope_memory, sp_weight, use_reentrant=False
