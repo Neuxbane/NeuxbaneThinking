@@ -6,6 +6,53 @@ from transformers import MambaForCausalLM, MambaConfig, AutoTokenizer
 from transformers.models.mamba.modeling_mamba import MambaCache
 from typing import Optional, Tuple, Union, List, Any
 
+# --- Q4_0 Quantization Support ---
+
+class Q4_0Linear(nn.Module):
+    """
+    Implements q4_0-style 4-bit quantization with block-wise scales.
+    Supports differentiable training via Straight-Through Estimator (STE).
+    """
+    def __init__(self, in_features, out_features, bias=False, block_size=32):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.block_size = block_size
+        
+        # Master weight in bfloat16. We use quantization in the forward pass.
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter("bias", None)
+        
+        # Initialize
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+
+    def get_quantized_weight(self):
+        # Differentiable quantization via STE
+        w = self.weight
+        out_f, in_f = w.shape
+        # Ensure divisible by block_size
+        if in_f % self.block_size != 0:
+            return w # Fallback if shape is weird
+            
+        w_reshaped = w.view(out_f, -1, self.block_size)
+        
+        # Block-wise scales
+        scales = w_reshaped.abs().max(dim=-1, keepdim=True).values / 7.0
+        # Quantize to [-8, 7]
+        q = torch.round(w_reshaped / (scales + 1e-6)).clamp(-8, 7)
+        # Dequantize
+        w_dequant = (q * scales).view(out_f, in_f)
+        
+        # Straight-Through Estimator: w_dequant in forward, grad(w) in backward
+        return w + (w_dequant - w).detach()
+
+    def forward(self, x):
+        w = self.get_quantized_weight()
+        return torch.nn.functional.linear(x, w.to(x.dtype), self.bias)
+
 class BPETokenizer:
     def __init__(self, model_id: str = "openai-community/gpt2"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -31,16 +78,16 @@ class DynamicScratchpad(nn.Module):
         self.num_pads = num_pads
         self.rank = rank
         
-        # Low-rank bottleneck to keep 72 specialists under 125M-130M budget
-        self.in_proj = nn.Linear(hidden_size, rank * 3, bias=False) # Q, U, F
-        self.out_proj = nn.Linear(rank, hidden_size, bias=False)
+        # Low-rank bottleneck via Q4_0Linear
+        self.in_proj = Q4_0Linear(hidden_size, rank * 3, bias=False) # Q, U, F
+        self.out_proj = Q4_0Linear(rank, hidden_size, bias=False)
         
         self.gate = nn.Parameter(torch.zeros(1))
-        # Lightweight evolution
+        # Lightweight evolution via Q4_0Linear
         self.evolve = nn.Sequential(
-            nn.Linear(hidden_size, rank, bias=False),
+            Q4_0Linear(hidden_size, rank, bias=False),
             nn.GELU(),
-            nn.Linear(rank, hidden_size, bias=False)
+            Q4_0Linear(rank, hidden_size, bias=False)
         )
         self.evolve_gate = nn.Parameter(torch.zeros(1))
         self.diffusion_kernel = nn.Parameter(torch.eye(num_pads))
@@ -145,7 +192,37 @@ class NeuxbaneThinking(nn.Module):
         self.load_specialists()
         # Default to bfloat16 for initial weights
         self.to(torch.bfloat16)
+        
+        # Expert Offload JIT: Move all experts to CPU initially
+        self.offload_specialists()
         self._is_gradient_checkpointing = False
+
+    def offload_specialists(self):
+        """Force all experts to CPU to save GPU RAM."""
+        for layer_ropes in self.specialist_grid:
+            for rope in layer_ropes.values():
+                rope.to("cpu")
+
+    def to(self, *args, **kwargs):
+        """Override to ensure specialists stay on CPU while base model moves to GPU."""
+        # Detect target dtype if any
+        target_dtype = None
+        for arg in args:
+            if isinstance(arg, torch.dtype): target_dtype = arg
+        if 'dtype' in kwargs: target_dtype = kwargs['dtype']
+
+        if target_dtype:
+            for layer_ropes in self.specialist_grid:
+                for rope in layer_ropes.values():
+                    rope.to(dtype=target_dtype)
+
+        # Hide specialist_grid from standard .to() recursive call
+        grid = self._modules.pop('specialist_grid')
+        try:
+            super().to(*args, **kwargs)
+        finally:
+            self._modules['specialist_grid'] = grid
+        return self
 
     def load_specialists(self):
         sp_dir = os.path.join(self.checkpoint_dir, "scratchpads")
@@ -219,6 +296,9 @@ class NeuxbaneThinking(nn.Module):
                     sp_weight = routing_weights[:, :, j].unsqueeze(-1) # [B, S, 1]
                     specialist = self.specialist_grid[i][f"rope_{j}"]
                     
+                    # JIT FETCHER: Move expert to GPU RAM only when needed
+                    specialist.to(device)
+                    
                     # Some Mamba versions might return [S, B, H] - rarely, but for robustness:
                     target_hs = hidden_states
                     if hidden_states.shape[0] != memory.shape[0] and hidden_states.dim() == 3:
@@ -238,8 +318,18 @@ class NeuxbaneThinking(nn.Module):
                     else:
                         combined_retrieval = combined_retrieval + delta
                     new_memories.append(m_out)
+                    
+                    # Optional: Offload back to CPU to save GPU RAM if not training
+                    # or if we want aggressive RAM management even during training.
+                    # For now, let's keep it simple: always fetch JIT, 
+                    # and offload at the end of the layer loop for maximum RAM efficiency.
                 else:
                     new_memories.append(rope_memory)
+            
+            # Post-Layer Offload: Move specialists back to CPU RAM
+            for j in range(self.num_ropes):
+                if active_ropes[j]:
+                    self.specialist_grid[i][f"rope_{j}"].to("cpu")
             
             # All ropes move to next layer
             memory = torch.stack(new_memories, dim=1)

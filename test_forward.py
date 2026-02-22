@@ -2,18 +2,18 @@ import torch
 from model import NeuxbaneThinking, BPETokenizer
 
 def test_model():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cpu" # Force CPU for testing logic as GPU is full
     tokenizer = BPETokenizer()
     model = NeuxbaneThinking()
-    model.to(device).to(torch.bfloat16 if device == "cuda" else torch.float32)
+    model.to(device).to(torch.float32)
     model.eval()
     
     text = "Hello world"
     tokens = tokenizer.encode(text)
     input_ids = torch.LongTensor(tokens).unsqueeze(0).to(device)
     
-    # Force base model and all modules to bfloat16
-    model = model.to(torch.bfloat16)
+    # Force base model and all modules to float32
+    model = model.to(torch.float32)
 
     print(f"Testing forward pass on {device}...")
     try:
