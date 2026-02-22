@@ -87,8 +87,8 @@ class DynamicScratchpad(nn.Module):
         # for tokens in the same sequence.
         # attn: [B, S, Pads], u: [B, S, Rank]
         # We want u_pads: [B, Pads, Rank]
-        u_pads = torch.einsum('bsp,bsr->bpr', attn, u)
-        f_pads = torch.einsum('bsp,bsr->bpr', attn, f_gate)
+        u_pads = torch.matmul(attn.transpose(-1, -2), u)
+        f_pads = torch.matmul(attn.transpose(-1, -2), f_gate)
         
         # Update memory in rank space
         memory_rank = memory_rank * (1.0 - f_pads.clamp(0, 1)) + u_pads
@@ -200,19 +200,27 @@ class NeuxbaneThinking(nn.Module):
                     sp_weight = routing_weights[:, :, j].unsqueeze(-1) # [B, S, 1]
                     specialist = self.specialist_grid[i][f"rope_{j}"]
                     
+                    # Ensure alignment of B, S dimensions in case Mamba layer swapped them
+                    if hidden_states.shape[0] != memory.shape[0]:
+                        target_hs = hidden_states.transpose(0, 1)
+                    else:
+                        target_hs = hidden_states
+
                     if self.training and self._is_gradient_checkpointing:
-                        # Use gradient checkpointing to save VRAM on sequential rope processing
                         h_out, m_out = torch.utils.checkpoint.checkpoint(
-                            specialist, hidden_states, rope_memory, sp_weight, use_reentrant=False
+                            specialist, target_hs, rope_memory, sp_weight, use_reentrant=False
                         )
                     else:
-                        h_out, m_out = specialist(hidden_states, rope_memory, weight=sp_weight)
+                        h_out, m_out = specialist(target_hs, rope_memory, weight=sp_weight)
                     
-                    # Combine retrieval based on routing weights
-                    combined_retrieval = combined_retrieval + sp_weight * (h_out - hidden_states)
+                    # Combine retrieval. Note that h_out and hidden_states must have same shape.
+                    # If we transposed, h_out will have different shape than hidden_states.
+                    if hidden_states.shape[0] != memory.shape[0]:
+                        combined_retrieval = combined_retrieval + (sp_weight * (h_out - target_hs)).transpose(0, 1)
+                    else:
+                        combined_retrieval = combined_retrieval + sp_weight * (h_out - hidden_states)
                     new_memories.append(m_out)
                 else:
-                    # Skip inactive specialist ropes to save VRAM and compute
                     new_memories.append(rope_memory)
             
             # All ropes move to next layer

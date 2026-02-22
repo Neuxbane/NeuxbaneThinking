@@ -1,6 +1,7 @@
 import os
 
 # Set VRAM allocation configuration for better efficiency
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import glob
