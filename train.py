@@ -9,7 +9,7 @@ import json
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset
-from model import NeuxbaneThinking, BPETokenizer
+from model import NeuxbaneSSM, BPETokenizer
 import signal
 import sys
 
@@ -22,79 +22,99 @@ except ImportError:
     from torch.optim import AdamW
 
 # Configuration
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.device_count() > 1 else "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "checkpoint/neuxbane_thinking_125m"
 DATASETS_DIR = "datasets"
 # High-performance hyper-parameters for convergence speed
-LEARNING_RATE = 4e-4 
+LEARNING_RATE = 1e-4 
 WEIGHT_DECAY = 0.01
 BATCH_SIZE = 1 
-ACCUMULATION_STEPS = 16 
-MAX_LENGTH = 64 # Small for stability
+ACCUMULATION_STEPS = 8 
+MAX_LENGTH = 512 # Increased for long reasoning chains
 GRAD_CLIP = 1.0
-WARMUP_STEPS = 50
-USE_GRADIENT_CHECKPOINTING = False # Not needed for 125M
+WARMUP_STEPS = 20
+USE_GRADIENT_CHECKPOINTING = True # Essential for high-density SSM on shared GPUs
 
 class JsonlDataset(IterableDataset):
     def __init__(self, directory, tokenizer, max_length):
         self.files = glob.glob(os.path.join(directory, "*.json*"))
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.samples = []
+        self._load_samples()
+
+    def _load_samples(self):
+        for file_path in self.files:
+            if not os.path.isfile(file_path): continue
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        if "conversations" in data:
+                            msgs = data["conversations"]
+                        else:
+                            q = data.get("query", data.get("instruction", ""))
+                            r = data.get("response", data.get("output", ""))
+                            msgs = [{"role": "user", "content": q}, {"role": "assistant", "content": r}]
+                        self.samples.append(msgs)
+                    except: continue
 
     def __iter__(self):
-        while True: # Infinite loop over files for infinite training
-            for file_path in self.files:
-                if not os.path.isfile(file_path): continue
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        try:
-                            data = json.loads(line)
-                            
-                            text = ""
-                            if "conversations" in data:
-                                # Use standard ChatML-like formatting with newlines for better breathing room
-                                for msg in data["conversations"]:
-                                    role = msg.get("role", "user")
-                                    content = msg.get("content", "")
-                                    if content: text += f"<{role}>\n{content}\n"
-                            else:
-                                query = data.get("query", data.get("instruction", ""))
-                                response = data.get("response", data.get("output", ""))
-                                if query: text += f"<user>\n{query}\n"
-                                if response: text += f"<assistant>\n{response}\n"
-                            
-                            if not text.strip(): continue
-                            
-                            # Encode with label masking (only train on assistant part)
-                            # Actually, for brevity let's just use the current simple training 
-                            # but with BETTER formatting. This will already help.
-                            encoded = self.tokenizer.encode(
-                                text,
-                                max_length=self.max_length,
-                                add_special_tokens=True
-                            )
-                            # Convert to torch tensor
-                            input_ids = torch.LongTensor(encoded)
-                            
-                            # Simple approach: train on everything (causal lm)
-                            # If you want to mask user part, you'd need a more complex loop here.
-                            yield input_ids, torch.ones_like(input_ids)
-                        except Exception:
-                            continue
+        import random
+        while True:
+            shuffled = list(self.samples)
+            random.shuffle(shuffled)
+            for msgs in shuffled:
+                input_ids = []
+                labels = []
+                
+                for msg in msgs:
+                    role = msg["role"]
+                    content = msg["content"]
+                    
+                    # Add role token
+                    role_token = self.tokenizer.user_token_id if role == "user" else self.tokenizer.assistant_token_id
+                    input_ids.append(role_token)
+                    labels.append(-100) # Don't predict role tags
+                    
+                    # Add newline
+                    nl_token = self.tokenizer.tokenizer.encode("\n", add_special_tokens=False)[0]
+                    input_ids.append(nl_token)
+                    labels.append(-100)
+                    
+                    # Add content
+                    tokens = self.tokenizer.tokenizer.encode(content, add_special_tokens=False)
+                    input_ids.extend(tokens)
+                    
+                    if role == "user":
+                        labels.extend([-100] * len(tokens))
+                    else:
+                        labels.extend(tokens)
+                        
+                    # Add terminal newline
+                    input_ids.append(nl_token)
+                    if role == "user":
+                        labels.append(-100)
+                    else:
+                        labels.append(nl_token)
+
+                # Truncate
+                input_ids = input_ids[:self.max_length]
+                labels = labels[:self.max_length]
+                
+                yield torch.LongTensor(input_ids), torch.LongTensor(labels)
 
 def save_model(model, optimizer, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # 1. Save Base Mamba Model + Routers
-    base_state = {k: v for k, v in model.state_dict().items() if not k.startswith("scratchpad_pool.")}
-    torch.save(base_state, path + ".pth")
+    # 1. Save all weights (Simplified since we built our own model)
+    torch.save(model.state_dict(), path + ".pth")
     
-    # 2. Save Specialist Pool
-    model.save_specialists()
+    # 2. Save Specialist Grid specifically if needed separate
+    # model.save_specialists()
     
-    # 3. Save Optimizer & Config
+    # 3. Save Optimizer state
     torch.save(optimizer.state_dict(), path + "_opt.pth")
-    model.base_model.config.save_pretrained(os.path.dirname(path))
-    print(f"\nCheckpoint saved: {path} (Mamba base + Specialist directory)")
+    print(f"\nCheckpoint saved: {path}.pth")
 
 def main():
     device = torch.device(DEVICE)
@@ -104,7 +124,7 @@ def main():
     tokenizer = BPETokenizer()
 
     # Initialize Model (GPT2-BPE-based 125M)
-    model = NeuxbaneThinking()
+    model = NeuxbaneSSM()
     
     # Enable Gradient Checkpointing to save memory
     if USE_GRADIENT_CHECKPOINTING:
@@ -116,7 +136,7 @@ def main():
     if os.path.exists(base_weight_path):
         print(f"Loading base Mamba weights from {base_weight_path}...")
         model.load_state_dict(torch.load(base_weight_path, map_location=device), strict=False)
-        # Scratchpads are loaded automatically by NeuxbaneThinking.__init__ calling self.load_scratchpads()
+        # Scratchpads are loaded automatically by NeuxbaneSSM.__init__ calling self.load_scratchpads()
     
     model.to(device)
     if device.type == "cuda":
@@ -149,7 +169,7 @@ def main():
         print(f"Loading existing optimizer state from {MODEL_PATH}_opt.pth")
         optimizer.load_state_dict(torch.load(MODEL_PATH + "_opt.pth", map_location=device))
         
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
     dataset = JsonlDataset(DATASETS_DIR, tokenizer, MAX_LENGTH)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE)
@@ -164,10 +184,11 @@ def main():
     step = 0
     try:
         print("Waiting for first batch...")
-        for input_ids, attention_mask in dataloader:
+        for input_ids, labels in dataloader:
             if step == 0: 
                 print(f"First batch received! Input shape: {input_ids.shape}")
             input_ids = input_ids.to(device)
+            labels = labels.to(device)
             
             # 1. FORWARD: Use Autocast + Mamba Seq Fallback
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -188,7 +209,7 @@ def main():
 
                 # Causal shift
                 shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = input_ids[..., 1:].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
                 
                 # Reshape for CrossEntropy
                 # flat_logits should be [Batch * Seq, Vocab]
@@ -213,7 +234,10 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 
-                print(f"Step: {step // ACCUMULATION_STEPS} | CE Loss: {accumulated_loss / ACCUMULATION_STEPS:.4f} | Aux: {aux_loss.item():.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+                # Normalize printed loss by batch/seq for readability
+                avg_ce = (accumulated_loss / ACCUMULATION_STEPS)
+                aux_val = aux_loss.item() if hasattr(aux_loss, "item") else aux_loss
+                print(f"Step: {step // ACCUMULATION_STEPS} | Per-Token Loss: {avg_ce:.4f} | Aux: {aux_val:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
                 accumulated_loss = 0
                 
                 # Periodic cache clearing to avoid fragmentation

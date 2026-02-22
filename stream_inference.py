@@ -1,7 +1,7 @@
 import os
 import torch
 import sys
-from model import NeuxbaneThinking, BPETokenizer
+from model import NeuxbaneSSM, BPETokenizer
 
 # Configuration
 MODEL_PATH = "checkpoint/neuxbane_thinking_125m"
@@ -9,14 +9,15 @@ MAX_NEW_TOKENS = 512 # BPE is more efficient, can generate more
 TEMPERATURE = 0.7
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Use Cuda 1 if available (often faster or chosen by user)
+    device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[*] Initializing on {device}...")
 
     # 1. Initialize standard GPT-2 BPE Tokenizer
     tokenizer = BPETokenizer()
 
     # 2. Initialize Model (GPT2-BPE-based 125M Architecture)
-    model = NeuxbaneThinking()
+    model = NeuxbaneSSM()
     
     # 3. Load Model weights if exist
     weights_path = MODEL_PATH + ".pth"
@@ -32,7 +33,7 @@ def main():
     model.eval()
 
     print("\n" + "="*50)
-    print(" NEUXBANE THINKING (MAMBA SSM + SCRATCHPAD - 125M BYTES)")
+    print(" NEUXBANE THINKING (CUSTOM SSM + SCRATCHPAD - 125M BYTES)")
     print(" Type your prompt and press Enter. Ctrl+C to exit.")
     print("="*50 + "\n")
 
@@ -44,50 +45,70 @@ def main():
             prompt = input("User> ").strip()
             if not prompt: continue
             
-            # Format prompt with the new training format (includes newlines)
-            # This helps the model distinguish roles better.
-            formatted_prompt = f"<user>\n{prompt}\n<assistant>\n"
+            # Format prompt matching the exact tokens in train.py
+            # [<user>] [198] [content] [198] [<assistant>] [198]
+            nl_token_id = tokenizer.tokenizer.encode("\n", add_special_tokens=False)[0]
             
-            # Encode
-            tokens = tokenizer.encode(formatted_prompt, add_special_tokens=True)
-            input_ids = torch.LongTensor(tokens).unsqueeze(0).to(device)
+            input_ids_list = [tokenizer.user_token_id, nl_token_id]
+            input_ids_list.extend(tokenizer.tokenizer.encode(prompt, add_special_tokens=False))
+            input_ids_list.extend([nl_token_id, tokenizer.assistant_token_id, nl_token_id])
+            
+            input_ids = torch.LongTensor(input_ids_list).unsqueeze(0).to(device)
             
             print("Assistant> ", end="", flush=True)
             
-            generated_ids = input_ids
-            # We reset cache_params per turn to allow fresh prompt processing, 
-            # but KEEP the Dynamic Scratchpad (memory) for long-term recall.
+            # Efficient decoding: Use KV-cache and positional indexing
             cache_params = None
+            total_seen = 0
+            current_input = input_ids
+            generated_ids = input_ids # Initialize generated_ids
             
             with torch.no_grad():
                 for i in range(MAX_NEW_TOKENS):
-                    # Temporary disable KV cache to bypass transformers' Mamba slow_forward bug
-                    # We pass the full history (generated_ids) every time.
-                    # This is slower but stable.
-                    logits, _, memory, _ = model(
-                        input_ids=generated_ids,
+                    S = current_input.shape[1]
+                    pos = torch.arange(total_seen, total_seen + S, device=device)
+                    
+                    logits, cache_params, memory, _ = model(
+                        input_ids=current_input,
                         memory=memory,
-                        use_cache=False
+                        cache_params=cache_params,
+                        use_cache=True,
+                        cache_position=pos
                     )
                     
-                    # Selection logic
+                    total_seen += S
+                    
                     next_token_logits = logits[:, -1, :] / max(TEMPERATURE, 1e-6)
+                    
+                    # Apply penalty to avoid loops
+                    if i > 0:
+                         window = generated_ids[0, -30:]
+                         for t in window:
+                             next_token_logits[0, t] -= 0.6
+                            
+                    # Numerical stability: clamp logits
+                    next_token_logits = torch.clamp(next_token_logits, -50, 50)
                     probs = torch.softmax(next_token_logits, dim=-1)
+                    
+                    # Safety check for NaN/Inf
+                    if torch.isnan(probs).any() or torch.isinf(probs).any():
+                        print("\n[!] Error: Model produced unstable probabilities (NaN/Inf).")
+                        break
+                        
                     next_token = torch.multinomial(probs, num_samples=1)
                     
-                    # Append to tracking
                     generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+                    # Next step only processes the single new token
+                    current_input = next_token
                     
-                    # Decode and stream the character
+                    # Decode and stream
                     char_token = next_token.item()
-                    
                     if char_token == tokenizer.eos_token_id:
                         break
                     
-                    # BytesTokenizer handles single bytes
-                    # We convert back to character for streaming
-                    char_out = tokenizer.decode([char_token])
-                    print(char_out, end="", flush=True)
+                    print(tokenizer.decode([char_token]), end="", flush=True)
+                    
+            print("\n")
                     
             print("\n")
             
