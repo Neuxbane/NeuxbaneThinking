@@ -10,7 +10,7 @@ import signal
 import sys
 
 # Configuration
-DEVICE = "cuda:1" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH = "checkpoint/neuxbane_thinking_125m"
 DATASETS_DIR = "datasets"
 # High-performance hyper-parameters for convergence speed
