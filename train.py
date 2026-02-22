@@ -1,4 +1,8 @@
 import os
+
+# Set VRAM allocation configuration for better efficiency
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import glob
 import json
 import torch
@@ -16,11 +20,12 @@ DATASETS_DIR = "datasets"
 # High-performance hyper-parameters for convergence speed
 LEARNING_RATE = 6e-4 
 WEIGHT_DECAY = 0.1
-BATCH_SIZE = 1 # Keep 1 for memory, but with short seq it's faster
+BATCH_SIZE = 1 # Keep 1 for memory
 ACCUMULATION_STEPS = 8 # Total BS = 8 (Effective Batch Size)
 MAX_LENGTH = 256
 GRAD_CLIP = 1.0
 WARMUP_STEPS = 100
+USE_GRADIENT_CHECKPOINTING = True
 
 class JsonlDataset(IterableDataset):
     def __init__(self, directory, tokenizer, max_length):
@@ -89,7 +94,9 @@ def main():
     model = NeuxbaneThinking()
     
     # Enable Gradient Checkpointing to save memory
-    model.base_model.gradient_checkpointing_enable()
+    if USE_GRADIENT_CHECKPOINTING:
+        print("Enabling Gradient Checkpointing for VRAM safety...")
+        model.gradient_checkpointing_enable()
     
     # Load Model weights if exist
     base_weight_path = MODEL_PATH + ".pth"
@@ -168,10 +175,14 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 
                 print(f"Step: {step // ACCUMULATION_STEPS} | Avg Loss: {accumulated_loss / ACCUMULATION_STEPS:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
                 accumulated_loss = 0
+                
+                # Periodic cache clearing to avoid fragmentation
+                if (step // ACCUMULATION_STEPS) % 100 == 0:
+                    torch.cuda.empty_cache()
             
             step += 1
             

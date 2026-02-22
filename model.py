@@ -152,6 +152,9 @@ class NeuxbaneThinking(nn.Module):
                 path = os.path.join(sp_dir, f"L{i}_R{j}.pth")
                 torch.save(self.specialist_grid[i][f"rope_{j}"].state_dict(), path)
 
+    def gradient_checkpointing_enable(self, **kwargs):
+        self.base_model.gradient_checkpointing_enable(**kwargs)
+
     def forward(self, input_ids, memory=None, cache_params=None, return_hidden=False, use_cache=True, cache_position=None):
         dtype = self.base_model.dtype
         device = input_ids.device
@@ -185,19 +188,30 @@ class NeuxbaneThinking(nn.Module):
             combined_retrieval = torch.zeros_like(hidden_states)
             new_memories = []
             
+            # Identify which ropes are active in the entire batch for optimization
+            active_ropes = torch.any(routing_weights > 0, dim=(0, 1))
+
             for j in range(self.num_ropes):
-                sp_weight = routing_weights[:, :, j].unsqueeze(-1) # [B, S, 1]
-                # Each rope j ALWAYS exists across the batch
-                specialist = self.specialist_grid[i][f"rope_{j}"]
                 rope_memory = memory[:, j]
                 
-                # Forward thru specialist (pass weight=None if skipping update for speed, 
-                # but better to pass sp_weight so it only updates where it was selected)
-                h_out, m_out = specialist(hidden_states, rope_memory, weight=sp_weight)
-                
-                # Combine retrieval based on routing weights
-                combined_retrieval = combined_retrieval + sp_weight * (h_out - hidden_states)
-                new_memories.append(m_out)
+                if active_ropes[j]:
+                    sp_weight = routing_weights[:, :, j].unsqueeze(-1) # [B, S, 1]
+                    specialist = self.specialist_grid[i][f"rope_{j}"]
+                    
+                    if self.training and self.base_model.config.gradient_checkpointing:
+                        # Use gradient checkpointing to save VRAM on sequential rope processing
+                        h_out, m_out = torch.utils.checkpoint.checkpoint(
+                            specialist, hidden_states, rope_memory, sp_weight, use_reentrant=False
+                        )
+                    else:
+                        h_out, m_out = specialist(hidden_states, rope_memory, weight=sp_weight)
+                    
+                    # Combine retrieval based on routing weights
+                    combined_retrieval = combined_retrieval + sp_weight * (h_out - hidden_states)
+                    new_memories.append(m_out)
+                else:
+                    # Skip inactive specialist ropes to save VRAM and compute
+                    new_memories.append(rope_memory)
             
             # All ropes move to next layer
             memory = torch.stack(new_memories, dim=1)
