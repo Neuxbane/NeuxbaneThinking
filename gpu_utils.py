@@ -114,17 +114,11 @@ def set_device(min_memory_gb=2.0):
     
     # Enable memory growth for CUDA to avoid pre-allocating all GPU memory
     if device.type == 'cuda':
-        # To strictly isolate the process to ONLY the selected GPU
-        gpu_idx = device.index 
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-        # Update the device object after setting the environment variable
-        device = torch.device('cuda:0')
-        
-        torch.cuda.set_per_process_memory_fraction(0.9, device)  # Use up to 90% of GPU
+        # Don't use os.environ["CUDA_VISIBLE_DEVICES"] here as CUDA is likely already initialized
+        # by get_best_device calls. Just set the device normally.
+        torch.cuda.set_device(device)
+        # Clear cache to ensure we start fresh
         torch.cuda.empty_cache()
-    else:
-        # If CPU is selected, we may also want to mask out GPUs entirely
-        os.environ["CUDA_VISIBLE_DEVICES"] = ""
     
     return device, device_name
 
