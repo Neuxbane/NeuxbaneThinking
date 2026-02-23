@@ -76,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         
         # RoPE precomputation
         head_dim = config.n_embd // config.n_head
-        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
         t = torch.arange(config.block_size).float()
         freqs = torch.outer(t, inv_freq) # (block_size, head_dim // 2)
         self.register_buffer("cos", freqs.cos().view(1, 1, config.block_size, head_dim // 2))
@@ -180,13 +180,14 @@ class Block(nn.Module):
         return x, new_kv_cache
 
 class TransformerConfig:
-    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_embd=384, n_scratchpad=64):
+    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_embd=384, n_scratchpad=64, rope_theta=10000.0):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_embd = n_embd
         self.n_scratchpad = n_scratchpad
+        self.rope_theta = rope_theta
 
 class Transformer(nn.Module):
     def __init__(self, config):
