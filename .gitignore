@@ -1,3 +1,4 @@
 checkpoint/
 __pycache__/
-datasets/
+datasets/medical-reasoning.jsonl
+datasets/dolci_think.jsonl
