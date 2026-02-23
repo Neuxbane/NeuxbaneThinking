@@ -209,6 +209,7 @@ def main():
     print("Starting training... Press Ctrl+C to interrupt and save.", flush=True)
     
     epoch = 0
+    prev_avg_loss = None
     while True:
         model.train()
         total_loss = 0
@@ -222,9 +223,17 @@ def main():
             optimizer.step()
             
             total_loss += loss.item()
-            print(f"Epoch {epoch} | Step {step}/{len(dataloader)} | Loss: {loss.item():.4f}", flush=True)
+            running_avg = total_loss / (step + 1)
+            
+            delta_str = ""
+            if prev_avg_loss is not None:
+                delta = running_avg - prev_avg_loss
+                delta_str = f" | Delta: {delta:+.4f}"
+
+            print(f"Epoch {epoch} | Step {step}/{len(dataloader)} | Loss: {loss.item():.4f} | Avg: {running_avg:.4f}{delta_str}", flush=True)
         
         avg_loss = total_loss / len(dataloader)
+        prev_avg_loss = avg_loss
         
         epoch += 1
         
