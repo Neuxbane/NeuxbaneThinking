@@ -1,263 +1,238 @@
 import os
-
-# Set VRAM allocation configuration for better efficiency
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
-import glob
 import json
+import glob
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, IterableDataset
-from model import NeuxbaneSSM, BPETokenizer
+from torch.utils.data import Dataset, DataLoader
+from model import Transformer, TransformerConfig, ByteTokenizer
+from gpu_utils import set_device
 import signal
 import sys
+import random
 
-# Optional bitandbytes for memory efficiency
-try:
-    import bitsandbytes as bnb
-    HAS_BNB = True
-except ImportError:
-    HAS_BNB = False
-    from torch.optim import AdamW
+dataset_samplings = {
+    "claude-4.5-high-reasoning": 100
+}
 
-# Configuration
-DEVICE = "cuda:0" if torch.cuda.device_count() > 1 else "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH = "checkpoint/neuxbane_thinking_125m"
-DATASETS_DIR = "datasets"
-# High-performance hyper-parameters for convergence speed
-LEARNING_RATE = 1e-4 
-WEIGHT_DECAY = 0.01
-BATCH_SIZE = 1 
-ACCUMULATION_STEPS = 8 
-MAX_LENGTH = 512 # Increased for long reasoning chains
-GRAD_CLIP = 1.0
-WARMUP_STEPS = 20
-USE_GRADIENT_CHECKPOINTING = True # Essential for high-density SSM on shared GPUs
-
-class JsonlDataset(IterableDataset):
-    def __init__(self, directory, tokenizer, max_length):
-        self.files = glob.glob(os.path.join(directory, "*.json*"))
+# --- Dataset ---
+class JSONLDataset(Dataset):
+    def __init__(self, data_root, tokenizer, block_size, samplings=None):
         self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.samples = []
-        self._load_samples()
+        self.block_size = block_size
+        self.examples = []
+        
+        if samplings is None:
+            samplings = {}
 
-    def _load_samples(self):
-        for file_path in self.files:
-            if not os.path.isfile(file_path): continue
-            with open(file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        data = json.loads(line)
-                        if "conversations" in data:
-                            msgs = data["conversations"]
-                        else:
-                            q = data.get("query", data.get("instruction", ""))
-                            r = data.get("response", data.get("output", ""))
-                            msgs = [{"role": "user", "content": q}, {"role": "assistant", "content": r}]
-                        self.samples.append(msgs)
-                    except: continue
+        # Search specifically for the files defined in samplings
+        potential_dirs = [data_root, "dmp"]
+        all_entries = []
+        
+        for name, limit in samplings.items():
+            found_file = None
+            for d in potential_dirs:
+                if os.path.exists(d):
+                    # Check for direct file or recursive glob
+                    candidate = os.path.join(d, f"{name}.jsonl")
+                    if os.path.exists(candidate):
+                        found_file = candidate
+                        break
+                    matches = glob.glob(os.path.join(d, f"**/{name}.jsonl"), recursive=True)
+                    if matches:
+                        found_file = matches[0]
+                        break
+            
+            if not found_file:
+                print(f"Warning: Dataset file for '{name}' not found.")
+                continue
 
-    def __iter__(self):
-        import random
-        while True:
-            shuffled = list(self.samples)
-            random.shuffle(shuffled)
-            for msgs in shuffled:
-                input_ids = []
-                labels = []
+            print(f"Loading '{name}' from {found_file} (limit: {limit})...")
+            
+            reservoir = []
+            with open(found_file, 'r', encoding='utf-8') as f:
+                if limit == -1:
+                    # Load all
+                    for line in f:
+                        try:
+                            reservoir.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+                else:
+                    # Memory-efficient Reservoir Sampling
+                    for idx, line in enumerate(f):
+                        try:
+                            if idx < limit:
+                                reservoir.append(json.loads(line))
+                            else:
+                                j = random.randint(0, idx)
+                                if j < limit:
+                                    reservoir[j] = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+            
+            all_entries.extend(reservoir)
+            print(f"Added {len(reservoir)} items from '{name}'.")
+        
+        # Final mix of the sampled entries from different files
+        random.shuffle(all_entries)
+        print(f"Total mixed items for training: {len(all_entries)}")
+
+        for data in all_entries:
+            convs = data.get("conversations", [])
+            tools = data.get("tools")
+            
+            tokens = []
+            targets = []
+            
+            # Start with BOS and tools definition (masked)
+            header_text = f"<bos>" + (f"<tools>{json.dumps(tools)}</tools>" if tools else "")
+            header_toks = self.tokenizer.encode(header_text)
+            tokens.extend(header_toks)
+            targets.extend([-1] * len(header_toks))
+            
+            for i, conv in enumerate(convs):
+                role = conv["role"]
+                content = conv.get("content", "")
                 
-                for msg in msgs:
-                    role = msg["role"]
-                    content = msg["content"]
-                    
-                    # Add role token
-                    role_token = self.tokenizer.user_token_id if role == "user" else self.tokenizer.assistant_token_id
-                    input_ids.append(role_token)
-                    labels.append(-100) # Don't predict role tags
-                    
-                    # Add newline
-                    nl_token = self.tokenizer.tokenizer.encode("\n", add_special_tokens=False)[0]
-                    input_ids.append(nl_token)
-                    labels.append(-100)
-                    
-                    # Add content
-                    tokens = self.tokenizer.tokenizer.encode(content, add_special_tokens=False)
-                    input_ids.extend(tokens)
-                    
-                    if role == "user":
-                        labels.extend([-100] * len(tokens))
-                    else:
-                        labels.extend(tokens)
-                        
-                    # Add terminal newline
-                    input_ids.append(nl_token)
-                    if role == "user":
-                        labels.append(-100)
-                    else:
-                        labels.append(nl_token)
-
-                # Truncate
-                input_ids = input_ids[:self.max_length]
-                labels = labels[:self.max_length]
+                # Role and internal tags (masked)
+                role_tags = f"<role>{role}</role>"
+                role_toks = self.tokenizer.encode(role_tags)
                 
-                yield torch.LongTensor(input_ids), torch.LongTensor(labels)
+                # Content
+                if role == "assistant" and "tool_calls" in conv:
+                    content = f"<tool_calls>{json.dumps(conv['tool_calls'])}</tool_calls>{content}"
+                content_toks = self.tokenizer.encode(content)
+                
+                # Assistant turns have content + eos as targets
+                # User turns are masked
+                tokens.extend(role_toks)
+                targets.extend([-1] * len(role_toks))
+                
+                tokens.extend(content_toks)
+                if role == "assistant":
+                    targets.extend(content_toks)
+                else:
+                    targets.extend([-1] * len(content_toks))
+                
+                if role == "assistant":
+                    eos_toks = self.tokenizer.encode("<eos>")
+                    tokens.extend(eos_toks)
+                    targets.extend(eos_toks)
+            
+            # Chunking correctly with paired labels
+            for j in range(0, len(tokens), self.block_size):
+                chunk_tokens = tokens[j : j + self.block_size + 1]
+                chunk_targets = targets[j : j + self.block_size + 1]
+                if len(chunk_tokens) > 1:
+                    # We store both so targets align with inputs
+                    self.examples.append((chunk_tokens, chunk_targets))
+        
+        print(f"Successfully processed {len(self.examples)} total chunks for training.")
 
-def save_model(model, optimizer, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # 1. Save all weights (Simplified since we built our own model)
-    torch.save(model.state_dict(), path + ".pth")
-    
-    # 2. Save Specialist Grid specifically if needed separate
-    # model.save_specialists()
-    
-    # 3. Save Optimizer state
-    torch.save(optimizer.state_dict(), path + "_opt.pth")
-    print(f"\nCheckpoint saved: {path}.pth")
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, idx):
+        tokens, targets = self.examples[idx]
+        
+        x = torch.zeros(self.block_size, dtype=torch.long)
+        y = torch.full((self.block_size,), -1, dtype=torch.long)
+
+        # Shifted targets: input tokens[i] predicts target targets[i+1]
+        length = min(len(tokens) - 1, self.block_size)
+        
+        x[:length] = torch.tensor(tokens[:length], dtype=torch.long)
+        y[:length] = torch.tensor(targets[1:length+1], dtype=torch.long)
+        
+        return x, y
+
+# --- Main Training Logic ---
+
+def save_model(model, path="model.pth"):
+    print(f"\nSaving model to {path}...")
+    torch.save(model.state_dict(), path)
 
 def main():
-    device = torch.device(DEVICE)
-    print(f"Using device: {device}")
+    # Setup
+    device, device_name = set_device(min_memory_gb=1.0)
+    data_dir = "datasets"
+    
+    tokenizer = ByteTokenizer()
+    print(f"Vocab size: {tokenizer.vocab_size}")
 
-    # Initialize standard GPT-2 BPE Tokenizer
-    tokenizer = BPETokenizer()
+    config = TransformerConfig(
+        vocab_size=tokenizer.vocab_size,
+        block_size=512,
+        n_layer=6,
+        n_head=6,
+        n_embd=384
+    )
+    
+    model = Transformer(config).to(device)
+    
+    # Load existing model
+    checkpoint_path = "model.pth"
+    if os.path.exists(checkpoint_path):
+        print(f"Loading existing model from {checkpoint_path}")
+        try:
+            state = torch.load(checkpoint_path, map_location=device)
+            try:
+                model.load_state_dict(state)
+                print("Checkpoint loaded (strict match). Continuing training from checkpoint.")
+            except RuntimeError as e_strict:
+                print(f"\n[!] Strict load failed: {e_strict}")
+                print("Attempting non-strict load (will ignore unexpected/missing keys)...")
+                try:
+                    model.load_state_dict(state, strict=False)
+                    print("Loaded checkpoint with non-strict matching. Some parameters/buffers may be left at initialization values.")
+                except Exception as e_nonstrict:
+                    print(f"Non-strict load also failed: {e_nonstrict}")
+                    print("Proceeding to train with newly initialized model (checkpoint not loaded).")
+        except Exception as e:
+            print(f"Error loading checkpoint file: {e}")
+            print("Proceeding to train with newly initialized model.")
 
-    # Initialize Model (GPT2-BPE-based 125M)
-    model = NeuxbaneSSM()
-    
-    # Enable Gradient Checkpointing to save memory
-    if USE_GRADIENT_CHECKPOINTING:
-        print("Enabling Gradient Checkpointing for VRAM safety...")
-        model.gradient_checkpointing_enable()
-    
-    # Load Model weights if exist
-    base_weight_path = MODEL_PATH + ".pth"
-    if os.path.exists(base_weight_path):
-        print(f"Loading base Mamba weights from {base_weight_path}...")
-        model.load_state_dict(torch.load(base_weight_path, map_location=device), strict=False)
-        # Scratchpads are loaded automatically by NeuxbaneSSM.__init__ calling self.load_scratchpads()
-    
-    model.to(device)
-    if device.type == "cuda":
-        model.to(torch.bfloat16)
-    else:
-        model.to(torch.float32)
-        
-    model.train()
+    dataset = JSONLDataset(data_dir, tokenizer, config.block_size, samplings=dataset_samplings)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
 
-    # Prepare Optimizer (Use bitsandbytes Adam8bit if available to save ~6GB VRAM)
-    if HAS_BNB:
-        print("Using BitsAndBytes 8-bit AdamW optimizer for memory efficiency...")
-        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    else:
-        print("Using standard PyTorch AdamW optimizer...")
-        optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    
-    # Cosine Annealing with Warmup for faster convergence
-    from torch.optim.lr_scheduler import LambdaLR
-    def lr_lambda(current_step):
-        if current_step < WARMUP_STEPS:
-            return float(current_step) / float(max(1, WARMUP_STEPS))
-        import math
-        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * (current_step - WARMUP_STEPS) / 10000)))
-    
-    scheduler = LambdaLR(optimizer, lr_lambda)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4)
 
-    # Load Optimizer if exist
-    if os.path.exists(MODEL_PATH + "_opt.pth"):
-        print(f"Loading existing optimizer state from {MODEL_PATH}_opt.pth")
-        optimizer.load_state_dict(torch.load(MODEL_PATH + "_opt.pth", map_location=device))
-        
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
-
-    dataset = JsonlDataset(DATASETS_DIR, tokenizer, MAX_LENGTH)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE)
-    print(f"Dataset files: {len(dataset.files)}")
-
-    print("Starting infinite training... Press Ctrl+C to stop and save.")
+    # Signal handler for immediate save
+    def signal_handler(sig, frame):
+        save_model(model, checkpoint_path)
+        sys.exit(0)
     
-    # Clear cache before starting
-    torch.cuda.empty_cache()
+    signal.signal(signal.SIGINT, signal_handler)
+
+    print("Starting training... Press Ctrl+C to interrupt and save.", flush=True)
     
-    accumulated_loss = 0
-    step = 0
-    try:
-        print("Waiting for first batch...")
-        for input_ids, labels in dataloader:
-            if step == 0: 
-                print(f"First batch received! Input shape: {input_ids.shape}")
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
+    epoch = 0
+    while True:
+        model.train()
+        total_loss = 0
+        for step, (x, y) in enumerate(dataloader):
+            x, y = x.to(device), y.to(device)
             
-            # 1. FORWARD: Use Autocast + Mamba Seq Fallback
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                outputs = model(
-                    input_ids=input_ids, 
-                    memory=None,
-                    use_cache=False
-                )
-                logits = outputs[0]
-                aux_loss = outputs[-1]
-
-                # Ensure logits is the actual tensor
-                if isinstance(logits, tuple):
-                    logits = logits[0]
-
-                if step == 0:
-                    print(f"Logits shape: {logits.shape}")
-
-                # Causal shift
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                
-                # Reshape for CrossEntropy
-                # flat_logits should be [Batch * Seq, Vocab]
-                # flat_labels should be [Batch * Seq]
-                flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-                flat_labels = shift_labels.view(-1)
-                
-                if step == 0:
-                    print(f"Flat logits: {flat_logits.shape} | Flat labels: {flat_labels.shape}")
-
-                ce_loss = criterion(flat_logits, flat_labels)
-                loss = (ce_loss + aux_loss) / ACCUMULATION_STEPS
+            logits, loss, _, _ = model(x, y)
             
-            # 2. BACKWARD: Gradient Scaling (implicit in Autocast/Bfloat16 context)
+            optimizer.zero_grad()
             loss.backward()
-            accumulated_loss += ce_loss.item() 
-
-            # 3. OPTIMIZER STEP (Every N steps)
-            if (step + 1) % ACCUMULATION_STEPS == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                
-                # Normalize printed loss by batch/seq for readability
-                avg_ce = (accumulated_loss / ACCUMULATION_STEPS)
-                aux_val = aux_loss.item() if hasattr(aux_loss, "item") else aux_loss
-                print(f"Step: {step // ACCUMULATION_STEPS} | Per-Token Loss: {avg_ce:.4f} | Aux: {aux_val:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
-                accumulated_loss = 0
-                
-                # Periodic cache clearing to avoid fragmentation
-                if (step // ACCUMULATION_STEPS) % 100 == 0:
-                    torch.cuda.empty_cache()
+            optimizer.step()
             
-            step += 1
-            
-            # Backup save every 100 actual steps
-            if step % 800 == 0:
-                save_model(model, optimizer, MODEL_PATH)
-
-    except KeyboardInterrupt:
-        print("\nInterrupted. Saving...")
-        save_model(model, optimizer, MODEL_PATH)
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-        save_model(model, optimizer, MODEL_PATH)
+            total_loss += loss.item()
+            print(f"Epoch {epoch} | Step {step}/{len(dataloader)} | Loss: {loss.item():.4f}", flush=True)
+        
+        avg_loss = total_loss / len(dataloader)
+        
+        epoch += 1
+        
+        # Auto-save every 50 epochs just in case
+        if epoch % 50 == 0:
+            save_model(model, checkpoint_path)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # This is also caught by signal_handler but just to be sure
+        pass

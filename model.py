@@ -1,236 +1,294 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.utils.checkpoint
-import os
+from torch.nn import functional as F
 import math
-from transformers import AutoTokenizer
-from typing import Optional, Tuple, Union, List, Any
+import re
 
-# --- Q4_0 Quantization Support ---
+class ByteTokenizer:
+    def __init__(self):
+        self.special_tokens = [
+            "<think>", "</think>", 
+            "<role>", "</role>", 
+            "<eos>", "<bos>", 
+            "<tools>", "</tools>",
+            "<tool_calls>", "</tool_calls>"
+        ]
+        # Mapping for special tokens starting from 256
+        self.special_to_id = {t: 256 + i for i, t in enumerate(self.special_tokens)}
+        self.id_to_special = {i: t for t, i in self.special_to_id.items()}
+        self.vocab_size = 256 + len(self.special_tokens)
+        
+        # Regex for matching special tokens or any single character
+        pattern = "|".join(re.escape(t) for t in self.special_tokens)
+        self.regex = re.compile(f"({pattern})")
 
-class Q4_0Linear(nn.Module):
-    def __init__(self, in_features, out_features, bias=False, block_size=32):
-        super().__init__()
-        self.in_features, self.out_features, self.block_size = in_features, out_features, block_size
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        if bias: self.bias = nn.Parameter(torch.zeros(out_features))
-        else: self.register_parameter("bias", None)
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+    def encode(self, text):
+        parts = self.regex.split(text)
+        ids = []
+        for part in parts:
+            if part in self.special_to_id:
+                ids.append(self.special_to_id[part])
+            else:
+                ids.extend(list(part.encode('utf-8')))
+        return ids
 
-    def get_quantized_weight(self):
-        w = self.weight
-        out_f, in_f = w.shape
-        if in_f % self.block_size != 0: return w
-        w_reshaped = w.view(out_f, -1, self.block_size)
-        scales = w_reshaped.abs().max(dim=-1, keepdim=True).values / 7.0
-        q = torch.round(w_reshaped / (scales + 1e-6)).clamp(-8, 7)
-        w_dequant = (q * scales).view(out_f, in_f)
-        return w + (w_dequant - w).detach()
-
-    def forward(self, x):
-        w = self.get_quantized_weight()
-        device, dtype = x.device, x.dtype
-        bias = self.bias.to(device=device, dtype=dtype) if self.bias is not None else None
-        return F.linear(x, w.to(device=device, dtype=dtype), bias)
+    def decode(self, ids):
+        out_bytes = bytearray()
+        result = ""
+        for i in ids:
+            if i in self.id_to_special:
+                if out_bytes:
+                    result += out_bytes.decode('utf-8', errors='replace')
+                    out_bytes = bytearray()
+                result += self.id_to_special[i]
+            elif 0 <= i < 256:
+                out_bytes.append(i)
+        
+        if out_bytes:
+            result += out_bytes.decode('utf-8', errors='replace')
+        return result
 
 class RMSNorm(nn.Module):
-    def __init__(self, d, eps=1e-5):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d))
-    def forward(self, x): return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        self.weight = nn.Parameter(torch.ones(dim))
 
-# --- Custom State Space Model (SSM) ---
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-class CustomSSM(nn.Module):
-    def __init__(self, d_model, d_state=16, d_expand=2, d_conv=4, layer_idx=0):
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.d_model, self.d_state, self.d_expand, self.layer_idx = d_model, d_state, d_expand, layer_idx
-        self.d_inner, self.d_conv = d_model * d_expand, d_conv
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-        self.conv = nn.Conv1d(self.d_inner, self.d_inner, d_conv, groups=self.d_inner, padding=d_conv-1)
-        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + self.d_inner, bias=False)
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
-        # Corrected A initialization: log of positive values
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
-
-    def forward(self, x, cache_params=None, cache_position=None):
-        B, S, _ = x.shape
-        xz = self.in_proj(x)
-        x_proj, z = xz.chunk(2, dim=-1)
-        if cache_params is not None and S == 1:
-            conv_state = cache_params.conv_states[self.layer_idx]
-            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
-            conv_state[:, :, -1] = x_proj.squeeze(1)
-            x_conv = torch.sum(conv_state * self.conv.weight.squeeze(1), dim=-1).unsqueeze(1)
-        else:
-            x_conv = self.conv(x_proj.transpose(1, 2))[:, :, :S].transpose(1, 2)
-            if cache_params is not None:
-                last_tokens = x_proj.transpose(1, 2)[:, :, -self.d_conv:]
-                if last_tokens.shape[-1] < self.d_conv: last_tokens = F.pad(last_tokens, (self.d_conv - last_tokens.shape[-1], 0))
-                cache_params.conv_states[self.layer_idx].copy_(last_tokens)
+        self.config = config
+        assert config.n_embd % config.n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # regularization
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
         
-        x_conv = F.silu(x_conv)
-        proj = self.x_proj(x_conv)
-        dt, B_vals, C_vals = torch.split(proj, [self.d_inner, self.d_state, self.d_state], dim=-1)
-        dt = F.softplus(self.dt_proj(dt)).to(torch.float32)
-        A = -torch.exp(self.A_log).to(torch.float32) 
+        # RoPE precomputation
+        head_dim = config.n_embd // config.n_head
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        t = torch.arange(config.block_size).float()
+        freqs = torch.outer(t, inv_freq) # (block_size, head_dim // 2)
+        self.register_buffer("cos", freqs.cos().view(1, 1, config.block_size, head_dim // 2))
+        self.register_buffer("sin", freqs.sin().view(1, 1, config.block_size, head_dim // 2))
+
+        # flash attention make GPU go brrr but for simplicity we use manual mask
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+
+    def _apply_rope(self, x, start_pos=0):
+        B, nh, T, hs = x.size()
+        cos = self.cos[:, :, start_pos:start_pos+T, :]
+        sin = self.sin[:, :, start_pos:start_pos+T, :]
         
-        if cache_params is not None and S == 1:
-            h = cache_params.ssm_states[self.layer_idx].to(torch.float32)
-            dA = torch.exp(dt[:, 0].unsqueeze(-1) * A.unsqueeze(0))
-            dB = dt[:, 0].unsqueeze(-1) * B_vals[:, 0].unsqueeze(1)
-            h = dA * h + dB * x_conv[:, 0].unsqueeze(-1)
-            cache_params.ssm_states[self.layer_idx].copy_(h)
-            y = torch.sum(h * C_vals[:, 0].unsqueeze(1), dim=-1).unsqueeze(1)
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        
+        out = torch.empty_like(x)
+        out[..., 0::2] = x1 * cos - x2 * sin
+        out[..., 1::2] = x1 * sin + x2 * cos
+        return out
+
+    def forward(self, x, kv_cache=None):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        
+        # Reshape to (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        start_pos = 0
+        if kv_cache is not None:
+            start_pos = kv_cache[0].shape[2]
+            
+        # rotate queries and keys using their positions
+        q = self._apply_rope(q, start_pos=start_pos)
+        k = self._apply_rope(k, start_pos=start_pos)
+
+        if kv_cache is not None:
+            # kv_cache is (torch.cat([prev_k, k]), torch.cat([prev_v, v]))
+            prev_k, prev_v = kv_cache
+            k = torch.cat([prev_k, k], dim=2)
+            v = torch.cat([prev_v, v], dim=2)
+        
+        new_kv_cache = (k, v)
+        
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T_total) -> (B, nh, T, T_total)
+        # where T_total is T + len(prev_kv)
+        T_total = k.size(2)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        
+        # Mask needs to be for (T, T_total)
+        # Original bias is (1, 1, block_size, block_size)
+        # For inference we usually use T=1.
+        if T > 1:
+            # Training or pre-fill
+            mask = self.bias[:,:,start_pos:start_pos+T,:T_total]
+            att = att.masked_fill(mask == 0, float('-inf'))
+        # If T=1 and we have cache, we don't strictly need masking because we only look back,
+        # but the bias buffer can still be used if we indexed it correctly.
+        # Actually, for T=1 it only attends to current and previous, which is already causal.
+        # But if start_pos=0 and T>1, it's the standard mask.
+
+        att = F.softmax(att, dim=-1)
+        y = att @ v # (B, nh, T, T_total) x (B, nh, T_total, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.c_proj(y)
+        return y, new_kv_cache
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # SwiGLU activation; using 4 * n_embd as intermediate dim
+        # We combine the gate and value projections into one c_fc for efficiency
+        self.c_fc    = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=False)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        x, gate = self.c_fc(x).chunk(2, dim=-1)
+        x = F.silu(x) * gate
+        x = self.c_proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = RMSNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = RMSNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x, kv_cache=None):
+        attn_out, new_kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache)
+        x = x + attn_out
+        x = x + self.mlp(self.ln_2(x))
+        return x, new_kv_cache
+
+class TransformerConfig:
+    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_embd=384, n_scratchpad=64):
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.n_scratchpad = n_scratchpad
+
+class Transformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = RMSNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        if config.n_scratchpad > 0:
+            self.scratchpad_init = nn.Parameter(torch.randn(config.n_scratchpad, config.n_embd) * 0.02)
         else:
-            h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=torch.float32)
-            outputs = []
-            for i in range(S):
-                dA = torch.exp(dt[:, i].unsqueeze(-1) * A.unsqueeze(0))
-                dB = dt[:, i].unsqueeze(-1) * B_vals[:, i].unsqueeze(1)
-                h = dA * h + dB * x_conv[:, i].unsqueeze(-1)
-                outputs.append(torch.sum(h * C_vals[:, i].unsqueeze(1), dim=-1))
-            y = torch.stack(outputs, dim=1)
-            if cache_params is not None: cache_params.ssm_states[self.layer_idx].copy_(h)
-        return self.out_proj(((y + x_conv * self.D) * F.silu(z)).to(xz.dtype))
+            self.scratchpad_init = None
 
-class MambaCache:
-    def __init__(self, config, batch_size, device, dtype):
-        self.conv_states = [torch.zeros(batch_size, config.hidden_size * config.expand, config.conv_kernel, device=device, dtype=dtype) for _ in range(config.num_hidden_layers)]
-        self.ssm_states = [torch.zeros(batch_size, config.hidden_size * config.expand, config.state_size, device=device, dtype=torch.float32) for _ in range(config.num_hidden_layers)]
+        # weight tying
+        self.transformer.wte.weight = self.lm_head.weight
 
-class MambaLayer(nn.Module):
-    def __init__(self, d_model, config, layer_idx):
-        super().__init__()
-        self.norm, self.mixer = RMSNorm(d_model), CustomSSM(d_model, config.state_size, config.expand, config.conv_kernel, layer_idx)
-    def forward(self, x, cache_params=None, cache_position=None): return x + self.mixer(self.norm(x), cache_params, cache_position)
+        # report number of parameters
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-class MambaConfig:
-    def __init__(self, vocab_size=50257, hidden_size=768, num_hidden_layers=24, state_size=16, expand=2, conv_kernel=4, rms_norm_eps=1e-5, **kwargs):
-        self.vocab_size, self.hidden_size, self.num_hidden_layers = vocab_size, hidden_size, num_hidden_layers
-        self.state_size, self.expand, self.conv_kernel, self.rms_norm_eps = state_size, expand, conv_kernel, rms_norm_eps
-        for k, v in kwargs.items(): setattr(self, k, v)
+    def get_num_params(self):
+        n_params = sum(p.numel() for p in self.parameters())
+        # subtract tied weight
+        n_params -= self.transformer.wte.weight.numel()
+        return n_params
 
-class DynamicScratchpad(nn.Module):
-    def __init__(self, hidden_size: int, num_pads: int = 128, rank: int = 32):
-        super().__init__()
-        self.hidden_size, self.num_pads, self.rank = hidden_size, num_pads, rank
-        self.in_proj, self.out_proj = Q4_0Linear(hidden_size, rank * 3, bias=False), Q4_0Linear(rank, hidden_size, bias=False)
-        self.gate, self.evolve_gate = nn.Parameter(torch.zeros(1)), nn.Parameter(torch.zeros(1))
-        self.evolve = nn.Sequential(Q4_0Linear(rank, rank, bias=False), nn.GELU(), Q4_0Linear(rank, rank, bias=False))
-        self.diffusion_kernel, self.mem_norm = nn.Parameter(torch.eye(num_pads)), RMSNorm(rank)
+    def forward(self, idx, targets=None, scratchpad=None, kv_caches=None):
+        device = idx.device
+        b, t = idx.size()
+        n_sp = self.config.n_scratchpad
+        
+        if kv_caches is None:
+            if t + n_sp > self.config.block_size:
+                t = self.config.block_size - n_sp
+                idx = idx[:, -t:]
+                if targets is not None:
+                    targets = targets[:, -t:]
 
-    def forward(self, x, memory_rank, weight=None):
-        if self.in_proj.weight.device != x.device: self.to(x.device)
-        was_2d = False
-        if x.dim() == 2: x, was_2d = x.unsqueeze(1), True
-        q, u, f = torch.split(self.in_proj(x), self.rank, dim=-1)
-        attn = torch.softmax(torch.matmul(q, memory_rank.transpose(-1, -2)) / (self.rank**0.5), dim=-1)
-        x_out = x + self.gate * self.out_proj(torch.matmul(attn, memory_rank))
-        f_gate = torch.sigmoid(f)
-        if weight is not None: u, f_gate = u * weight, f_gate * weight
-        memory_rank = memory_rank * (1.0 - torch.matmul(attn.transpose(-1, -2), f_gate).clamp(0, 1)) + torch.matmul(attn.transpose(-1, -2), u)
-        memory_rank = self.mem_norm(torch.matmul(self.diffusion_kernel, memory_rank) + self.evolve_gate * self.evolve(memory_rank))
-        return (x_out.squeeze(1) if was_2d else x_out), memory_rank
-
-class BPETokenizer:
-    def __init__(self, model_id="openai-community/gpt2"):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>", "<user>", "<assistant>"]})
-        self.vocab_size = len(self.tokenizer)
-        self.bos_token_id = self.tokenizer.bos_token_id or self.tokenizer.eos_token_id
-        self.eos_token_id, self.user_token_id, self.assistant_token_id = self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids("<user>"), self.tokenizer.convert_tokens_to_ids("<assistant>")
-    def encode(self, text, add_special_tokens=True, max_length=None): return self.tokenizer.encode(text, add_special_tokens=add_special_tokens, truncation=True, max_length=max_length)
-    def decode(self, token_ids): return self.tokenizer.decode(token_ids)
-
-class NeuxbaneSSM(nn.Module):
-    def __init__(self, model_id_or_path=None, checkpoint_dir="checkpoint"):
-        super().__init__()
-        self.checkpoint_dir, self.tokenizer_bpe = checkpoint_dir, BPETokenizer()
-        vocab_size = self.tokenizer_bpe.vocab_size
-        self.config = MambaConfig(vocab_size=vocab_size, hidden_size=768, num_hidden_layers=24, state_size=16, expand=2, conv_kernel=4)
-        self.embeddings = nn.Embedding(vocab_size, 768)
-        self.layers = nn.ModuleList([MambaLayer(768, self.config, i) for i in range(24)])
-        self.norm_f = RMSNorm(768)
-        self.lm_head = nn.Linear(768, vocab_size, bias=False)
-        self.lm_head.weight = self.embeddings.weight
-        self.specialist_grid = nn.ModuleList([nn.ModuleDict({f"rope_{j}": DynamicScratchpad(768) for j in range(4)}) for i in range(24)])
-        self.routers = nn.ModuleList([nn.Linear(768, 4) for _ in range(24)])
-        self.rope_init = nn.Parameter(torch.zeros(4, 128, 32))
-        self.load_specialists(); self.to(torch.bfloat16); self._is_gradient_checkpointing = False
-
-    def load_specialists(self):
-        path = os.path.join(self.checkpoint_dir, "specialists.pt")
-        if os.path.exists(path):
-            try: self.specialist_grid.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
-            except: pass
-
-    def save_specialists(self):
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        torch.save(self.specialist_grid.state_dict(), os.path.join(self.checkpoint_dir, "specialists.pt"))
-
-    def gradient_checkpointing_enable(self, **kwargs): self._is_gradient_checkpointing = True
-
-    def _forward_layer(self, layer_idx, hidden_states, memory, cache_params, cache_position):
-        h_mamba = self.layers[layer_idx](hidden_states, cache_params, cache_position)
-        router_logits = self.routers[layer_idx](h_mamba).to(torch.float32)
-        routing_weights = torch.softmax(router_logits, dim=-1).to(hidden_states.dtype)
-        top_k_idx = torch.topk(routing_weights, k=2, dim=-1).indices
-        mask = torch.zeros_like(routing_weights).scatter_(-1, top_k_idx, 1.0)
-        routing_weights = (routing_weights * mask) / (routing_weights * mask).sum(dim=-1, keepdim=True).clamp(1e-6)
-        new_mems, combined_delta = [], torch.zeros_like(h_mamba)
-        for j in range(4):
-            h_out, m_out = self.specialist_grid[layer_idx][f"rope_{j}"](h_mamba, memory[:, j], routing_weights[:, :, j:j+1])
-            combined_delta += routing_weights[:, :, j:j+1] * (h_out - h_mamba)
-            new_mems.append(m_out)
-
-        # Re-introduce aux loss for router stability
-        z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1)**2)
-        freqs = routing_weights.mean(dim=(0, 1))
-        # Probability distribution of the router
-        probs = torch.softmax(router_logits.mean(dim=(0, 1)), dim=-1)
-        # Load balancing loss (MoE style)
-        aux_loss = 4.0 * torch.sum(freqs * probs) # Normalize by num_ropes
-        total_aux = 0.01 * (z_loss * 0.1 + aux_loss)
-
-        return h_mamba + combined_delta, torch.stack(new_mems, dim=1), total_aux
-
-    def forward(self, input_ids, memory=None, cache_params=None, return_hidden=False, use_cache=False, cache_position=None):
-        dtype, device = self.lm_head.weight.dtype, input_ids.device
-        if input_ids.dim() == 1: input_ids = input_ids.unsqueeze(0)
-        B, S = input_ids.shape
-        if memory is None: memory = self.rope_init.unsqueeze(0).repeat(B, 1, 1, 1).to(device).to(dtype)
-        hidden_states, total_aux = self.embeddings(input_ids).to(dtype), 0.0
-        if use_cache and cache_params is None: cache_params = MambaCache(self.config, B, device, dtype)
-        for i in range(24):
-            if self.training and self._is_gradient_checkpointing:
-                hidden_states, memory, layer_aux = torch.utils.checkpoint.checkpoint(self._forward_layer, i, hidden_states, memory, cache_params, cache_position, use_reentrant=False)
+            tok_emb = self.transformer.wte(idx) 
+            
+            if n_sp > 0:
+                if scratchpad is None:
+                    scratchpad = self.scratchpad_init.unsqueeze(0).expand(b, -1, -1)
+                x = torch.cat([scratchpad, tok_emb], dim=1)
             else:
-                hidden_states, memory, layer_aux = self._forward_layer(i, hidden_states, memory, cache_params, cache_position)
-            total_aux += layer_aux
-        hidden_states = self.norm_f(hidden_states)
-        logits = self.lm_head(hidden_states)
-        if return_hidden: return logits, cache_params, memory, total_aux, hidden_states
-        return logits, cache_params, memory, total_aux
+                x = tok_emb
+            kv_caches = [None] * len(self.transformer.h)
+        else:
+            tok_emb = self.transformer.wte(idx)
+            x = tok_emb
 
-    def generate(self, input_ids, max_new_tokens=50, temperature=0.7, top_p=0.9):
-        self.eval()
-        current_ids, memory, cache_params = input_ids, None, None
-        for i in range(max_new_tokens):
-            with torch.no_grad():
-                step_ids = current_ids if i == 0 else current_ids[:, -1:]
-                logits, cache_params, memory, _ = self.forward(step_ids, memory, cache_params, use_cache=True)
-                next_token_logits = logits[:, -1, :] / (temperature + 1e-6)
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = (cumulative_probs > top_p); sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone(); sorted_indices_to_remove[..., 0] = 0
-                next_token_logits[sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)] = -float('Inf')
-                next_token = torch.multinomial(F.softmax(next_token_logits, dim=-1), 1)
-                current_ids = torch.cat([current_ids, next_token], dim=-1)
-                if next_token.item() == self.tokenizer_bpe.eos_token_id: break
-        return current_ids
+        new_kv_caches = []
+        for i, block in enumerate(self.transformer.h):
+            x, cache = block(x, kv_cache=kv_caches[i])
+            new_kv_caches.append(cache)
+            
+        x = self.transformer.ln_f(x)
+        
+        if n_sp > 0 and (kv_caches[0] is None):
+            new_scratchpad = x[:, :n_sp, :]
+            logits_seq = x[:, n_sp:, :]
+        else:
+            new_scratchpad = None
+            logits_seq = x
+            
+        logits = self.lm_head(logits_seq)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+
+        return logits, loss, new_scratchpad, new_kv_caches
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        """
+        full_idx = idx
+        scratchpad = None
+        kv_caches = None
+
+        for _ in range(max_new_tokens):
+            # forward the model to get the logits for the index in the sequence
+            logits, _, scratchpad, kv_caches = self(idx, scratchpad=scratchpad, kv_caches=kv_caches)
+            # pluck the logits at the final step and scale by desired temperature
+            logits_step = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits_step, min(top_k, logits_step.size(-1)))
+                logits_step[logits_step < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits_step, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            full_idx = torch.cat((full_idx, idx_next), dim=1)
+            idx = idx_next
+
+        return full_idx
