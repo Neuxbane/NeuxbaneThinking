@@ -7,7 +7,7 @@ from gpu_utils import set_device
 
 
 @torch.no_grad()
-def stream_generate(model, tokenizer, prompt, max_new_tokens=500, temperature=0.7, device='cpu'):
+def stream_generate(model, tokenizer, prompt, max_new_tokens=4096, temperature=0.7, device='cpu'):
     model.eval()
     idx = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
     
@@ -15,10 +15,9 @@ def stream_generate(model, tokenizer, prompt, max_new_tokens=500, temperature=0.
     full_ids = idx[0].tolist()
     last_decoded = tokenizer.decode(full_ids)
 
-    scratchpad = None
     kv_caches = None
     for _ in range(max_new_tokens):
-        logits, _, scratchpad, kv_caches = model(idx, scratchpad=scratchpad, kv_caches=kv_caches)
+        logits, _, kv_caches = model(idx, kv_caches=kv_caches)
         logits_step = logits[:, -1, :] / temperature
         
         probs = torch.nn.functional.softmax(logits_step, dim=-1)

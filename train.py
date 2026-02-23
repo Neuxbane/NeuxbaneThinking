@@ -11,8 +11,12 @@ import sys
 import random
 
 dataset_samplings = {
-    "claude-4.5-high-reasoning": -1,
-    "stem_reasoning": 0,
+    "claude-4.5-high-reasoning": 100,
+    "dolci_think": 100,
+    "tiny_think":100,
+    "medical-reasoning": 100,
+    "glaive-function-calling-v2-query": 100,
+    "ToolACE-query": 100,
 }
 
 # --- Dataset ---
@@ -150,7 +154,14 @@ class JSONLDataset(Dataset):
 # --- Main Training Logic ---
 
 def save_model(model, path="model.pth"):
-    print(f"\nSaving model to {path}...")
+    # Print GPU memory usage before saving
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        max_allocated = torch.cuda.max_memory_allocated() / (1024**3)
+        print(f"\n[GPU Memory] Current Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB | Peak: {max_allocated:.2f} GB")
+
+    print(f"Saving model to {path}...")
     torch.save(model.state_dict(), path)
 
 def main():
@@ -198,6 +209,12 @@ def main():
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4)
+    # Use torch.compile to speed up the model (especially with Flash Attention)
+    try:
+        print("Compiling model for performance...")
+        model = torch.compile(model)
+    except Exception as e:
+        print(f"torch.compile failed or not supported: {e}")
 
     # Signal handler for immediate save
     def signal_handler(sig, frame):
@@ -216,7 +233,7 @@ def main():
         for step, (x, y) in enumerate(dataloader):
             x, y = x.to(device), y.to(device)
             
-            logits, loss, _, _ = model(x, y)
+            logits, loss, _ = model(x, y)
             
             optimizer.zero_grad()
             loss.backward()
@@ -231,6 +248,13 @@ def main():
                 delta_str = f" | Delta: {delta:+.4f}"
 
             print(f"Epoch {epoch} | Step {step}/{len(dataloader)} | Loss: {loss.item():.4f} | Avg: {running_avg:.4f}{delta_str}", flush=True)
+
+            # Periodically report GPU VRAM
+            if step % 200 == 0:
+                if torch.cuda.is_available():
+                    alloc = torch.cuda.memory_allocated() / (1024**3)
+                    peak = torch.cuda.max_memory_allocated() / (1024**3)
+                    print(f" >>> [GPU VRAM] Allocated: {alloc:.2f}GB / Peak: {peak:.2f}GB", flush=True)
         
         avg_loss = total_loss / len(dataloader)
         prev_avg_loss = avg_loss

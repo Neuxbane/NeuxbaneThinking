@@ -78,15 +78,18 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         
         # RoPE precomputation
+        # Total effective sequence length must include the prefix scratchpad
+        effective_block_size = config.block_size + config.n_scratchpad
         inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
-        t = torch.arange(config.block_size).float()
-        freqs = torch.outer(t, inv_freq) # (block_size, head_dim // 2)
-        self.register_buffer("cos", freqs.cos().view(1, 1, config.block_size, self.head_dim // 2))
-        self.register_buffer("sin", freqs.sin().view(1, 1, config.block_size, self.head_dim // 2))
+        t = torch.arange(effective_block_size).float()
+        freqs = torch.outer(t, inv_freq) # (effective_block_size, head_dim // 2)
+        self.register_buffer("cos", freqs.cos().view(1, 1, effective_block_size, self.head_dim // 2))
+        self.register_buffer("sin", freqs.sin().view(1, 1, effective_block_size, self.head_dim // 2))
 
-        # flash attention make GPU go brrr but for simplicity we use manual mask
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+        # flash attention uses internal causal mask when is_causal=True
+        # but we keep bias for cases where manual masking might be needed
+        self.register_buffer("bias", torch.tril(torch.ones(effective_block_size, effective_block_size))
+                                     .view(1, 1, effective_block_size, effective_block_size))
 
     def _apply_rope(self, x, start_pos=0):
         B, nh, T, hs = x.size()
@@ -120,9 +123,10 @@ class CausalSelfAttention(nn.Module):
             # kv_cache[0].shape[2] represents the number of already cached tokens
             start_pos += kv_cache[0].shape[2]
             
-            # Bound context to within block_size to avoid out-of-range on precomputed RoPE/masks
-            if start_pos + T > self.config.block_size:
-                excess = start_pos + T - self.config.block_size
+            # Bound context to avoid out-of-range on precomputed RoPE/masks
+            max_seq_len = self.cos.size(2)
+            if start_pos + T > max_seq_len:
+                excess = start_pos + T - max_seq_len
                 prev_k, prev_v = kv_cache
                 kv_cache = (prev_k[:, :, excess:, :], prev_v[:, :, excess:, :])
                 start_pos -= excess
@@ -132,7 +136,6 @@ class CausalSelfAttention(nn.Module):
         k = self._apply_rope(k, start_pos=start_pos)
 
         if kv_cache is not None:
-            # kv_cache is (prev_k, prev_v)
             prev_k, prev_v = kv_cache
             k = torch.cat([prev_k, k], dim=2)
             v = torch.cat([prev_v, v], dim=2)
@@ -142,52 +145,15 @@ class CausalSelfAttention(nn.Module):
         # repeat KV heads if n_kv_head < n_head
         if self.n_kv_head != self.n_head:
             n_rep = self.n_head // self.n_kv_head
-            # (B, n_kv_head, T_total, head_dim) -> (B, n_kv_head, n_rep, T_total, head_dim) -> (B, n_head, T_total, head_dim)
             k = k[:, :, None, :, :].expand(B, self.n_kv_head, n_rep, k.size(2), self.head_dim).reshape(B, self.n_head, k.size(2), self.head_dim)
             v = v[:, :, None, :, :].expand(B, self.n_kv_head, n_rep, v.size(2), self.head_dim).reshape(B, self.n_head, v.size(2), self.head_dim)
         
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T_total) -> (B, nh, T, T_total)
-        T_total = k.size(2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        # Flash Attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=(T > 1 and kv_cache is None))
         
-        if T > 1:
-            mask = self.bias[:,:,start_pos:start_pos+T,:T_total]
-            att = att.masked_fill(mask == 0, float('-inf'))
-
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T_total) x (B, nh, T_total, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_embd) # re-assemble all head outputs side by side
-
-        # output projection
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_embd)
         y = self.c_proj(y)
         return y, new_kv_cache
-
-class CrossAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.head_dim = config.n_embd // config.n_head
-        
-        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.k_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.v_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, q, k, v):
-        B, Tq, C = q.size()
-        B, Tk, Ck = k.size()
-        
-        q = self.q_proj(q).view(B, Tq, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(k).view(B, Tk, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.v_proj(v).view(B, Tk, self.n_head, self.head_dim).transpose(1, 2)
-        
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, Tq, C)
-        return self.c_proj(y)
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -209,47 +175,15 @@ class Block(nn.Module):
         self.config = config
         self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        
-        if config.n_scratchpad > 0:
-            # Tokens query the scratchpad to "read" from memory
-            self.ln_read_tok = RMSNorm(config.n_embd)
-            self.ln_read_sp  = RMSNorm(config.n_embd)
-            self.read_attn = CrossAttention(config)
-            
-            # Scratchpad queries the tokens to "decide" what to write/update
-            self.ln_write_sp  = RMSNorm(config.n_embd)
-            self.ln_write_tok = RMSNorm(config.n_embd)
-            self.write_attn = CrossAttention(config)
-
-            # Gated memory update logic (replaces simple residual)
-            self.sp_gate = nn.Linear(2 * config.n_embd, config.n_embd)
-            self.sp_update_proj = nn.Linear(config.n_embd, config.n_embd)
-
         self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x, scratchpad=None, kv_cache=None, start_pos_offset=0):
-        # 1. Self-Attention on tokens
+    def forward(self, x, kv_cache=None, start_pos_offset=0):
+        # Self-Attention handles prefix memory naturally via causal mask if prepended
         attn_out, new_kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache, start_pos_offset=start_pos_offset)
         x = x + attn_out
-        
-        if scratchpad is not None:
-            # 2. Tokens read from Scratchpad
-            # Tokens are Q, Scratchpad is KV
-            x = x + self.read_attn(self.ln_read_tok(x), self.ln_read_sp(scratchpad), self.ln_read_sp(scratchpad))
-            
-            # 3. Scratchpad writes from Tokens
-            # Scratchpad is Q, Tokens are KV
-            # Gated Update (like a simplified GRU/LSTM gate)
-            raw_update = self.write_attn(self.ln_write_sp(scratchpad), self.ln_write_tok(x), self.ln_write_tok(x))
-            
-            gate = torch.sigmoid(self.sp_gate(torch.cat([scratchpad, raw_update], dim=-1)))
-            candidate = torch.tanh(self.sp_update_proj(raw_update))
-            scratchpad = (1 - gate) * scratchpad + gate * candidate
-
-        # 4. MLP on tokens
         x = x + self.mlp(self.ln_2(x))
-        return x, scratchpad, new_kv_cache
+        return x, new_kv_cache
 
 class TransformerConfig:
     def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_kv_head=None, n_embd=384, n_scratchpad=64, rope_theta=10000.0):
@@ -275,13 +209,10 @@ class Transformer(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         if config.n_scratchpad > 0:
-            # Memory initialization state
+            # Prefix memory initialization state
             self.scratchpad_init = nn.Parameter(torch.randn(config.n_scratchpad, config.n_embd) * 0.02)
-            # Learnable positional embeddings for memory slots to give them distinct indices/identities
-            self.scratchpad_pos = nn.Parameter(torch.randn(config.n_scratchpad, config.n_embd) * 0.02)
         else:
             self.scratchpad_init = None
-            self.scratchpad_pos = None
 
         # weight tying
         self.transformer.wte.weight = self.lm_head.weight
@@ -295,11 +226,10 @@ class Transformer(nn.Module):
         n_params -= self.transformer.wte.weight.numel()
         return n_params
 
-    def forward(self, idx, targets=None, scratchpad=None, kv_caches=None):
+    def forward(self, idx, targets=None, kv_caches=None):
         device = idx.device
         b, t = idx.size()
         n_sp = self.config.n_scratchpad
-        start_pos_offset = 0 # Positions start from 0 for tokens
         
         if kv_caches is None:
             # Prefill / Initial forward pass
@@ -311,19 +241,21 @@ class Transformer(nn.Module):
 
             x = self.transformer.wte(idx) 
             if n_sp > 0:
-                if scratchpad is None:
-                    # Initialize with both base state and slot-specific positional info
-                    scratchpad = (self.scratchpad_init + self.scratchpad_pos).unsqueeze(0).expand(b, -1, -1)
+                # Prepend the scratchpad tokens as "Prefix Memory"
+                prefix = self.scratchpad_init.unsqueeze(0).expand(b, -1, -1)
+                x = torch.cat([prefix, x], dim=1)
+                if targets is not None:
+                    # Offset targets to align with sequence tokens
+                    target_pad = torch.full((b, n_sp), -1, dtype=targets.dtype, device=targets.device)
+                    targets = torch.cat([target_pad, targets], dim=1)
             kv_caches = [None] * len(self.transformer.h)
         else:
-            # Incremental generation pass
+            # Incremental pass: kv_caches already contains the prefix
             x = self.transformer.wte(idx)
-            if n_sp > 0 and scratchpad is None:
-                scratchpad = (self.scratchpad_init + self.scratchpad_pos).unsqueeze(0).expand(b, -1, -1)
 
         new_kv_caches = []
         for i, block in enumerate(self.transformer.h):
-            x, scratchpad, cache = block(x, scratchpad=scratchpad, kv_cache=kv_caches[i], start_pos_offset=start_pos_offset)
+            x, cache = block(x, kv_cache=kv_caches[i], start_pos_offset=0)
             new_kv_caches.append(cache)
             
         x = self.transformer.ln_f(x)
@@ -333,7 +265,7 @@ class Transformer(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
 
-        return logits, loss, scratchpad, new_kv_caches
+        return logits, loss, new_kv_caches
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -342,12 +274,11 @@ class Transformer(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         """
         full_idx = idx
-        scratchpad = None
         kv_caches = None
 
         for _ in range(max_new_tokens):
             # forward the model to get the logits for the index in the sequence
-            logits, _, scratchpad, kv_caches = self(idx, scratchpad=scratchpad, kv_caches=kv_caches)
+            logits, _, kv_caches = self(idx, kv_caches=kv_caches)
             # pluck the logits at the final step and scale by desired temperature
             logits_step = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
