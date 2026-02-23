@@ -11,7 +11,8 @@ import sys
 import random
 
 dataset_samplings = {
-    "claude-4.5-high-reasoning": 100
+    "claude-4.5-high-reasoning": -1,
+    "stem_reasoning": 0,
 }
 
 # --- Dataset ---
@@ -154,7 +155,8 @@ def save_model(model, path="model.pth"):
 
 def main():
     # Setup
-    device, device_name = set_device(min_memory_gb=1.0)
+    # Require 2.0GB to avoid nearly-full GPUs which often lead to OOM later in training.
+    device, device_name = set_device(min_memory_gb=2.0)
     data_dir = "datasets"
     
     tokenizer = ByteTokenizer()

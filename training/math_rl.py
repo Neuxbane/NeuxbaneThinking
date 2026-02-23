@@ -158,7 +158,7 @@ def get_log_probs(model, input_ids, gen_ids, eos_id):
 
 def train():
     # Setup
-    device, _ = set_device(min_memory_gb=1.0)
+    device, _ = set_device(min_memory_gb=2.0)
     tokenizer = ByteTokenizer()
     eos_id = tokenizer.special_to_id["<eos>"]
     

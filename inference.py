@@ -38,7 +38,7 @@ def stream_generate(model, tokenizer, prompt, max_new_tokens=500, temperature=0.
 
 
 def main():
-    device, _ = set_device(min_memory_gb=1.0)
+    device, _ = set_device(min_memory_gb=2.0)
     tokenizer = ByteTokenizer()
     
     config = TransformerConfig(

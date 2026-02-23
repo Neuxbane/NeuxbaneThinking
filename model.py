@@ -67,20 +67,22 @@ class CausalSelfAttention(nn.Module):
         self.config = config
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        # regularization
+        # We support Grouped-Query Attention (GQA) where multiple queries share a single KV head
         self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        
+        self.c_attn = nn.Linear(config.n_embd, (self.n_head + 2 * self.n_kv_head) * self.head_dim, bias=False)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         
         # RoPE precomputation
-        head_dim = config.n_embd // config.n_head
-        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         t = torch.arange(config.block_size).float()
         freqs = torch.outer(t, inv_freq) # (block_size, head_dim // 2)
-        self.register_buffer("cos", freqs.cos().view(1, 1, config.block_size, head_dim // 2))
-        self.register_buffer("sin", freqs.sin().view(1, 1, config.block_size, head_dim // 2))
+        self.register_buffer("cos", freqs.cos().view(1, 1, config.block_size, self.head_dim // 2))
+        self.register_buffer("sin", freqs.sin().view(1, 1, config.block_size, self.head_dim // 2))
 
         # flash attention make GPU go brrr but for simplicity we use manual mask
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -99,57 +101,86 @@ class CausalSelfAttention(nn.Module):
         out[..., 1::2] = x1 * sin + x2 * cos
         return out
 
-    def forward(self, x, kv_cache=None):
+    def forward(self, x, kv_cache=None, start_pos_offset=0):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # calculate query, key, values
+        # q: (B, T, n_head * head_dim), k: (B, T, n_kv_head * head_dim), v: (B, T, n_kv_head * head_dim)
+        q_size = self.n_head * self.head_dim
+        kv_size = self.n_kv_head * self.head_dim
+        q, k, v  = self.c_attn(x).split([q_size, kv_size, kv_size], dim=2)
         
-        # Reshape to (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        # Reshape to multi-head format
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, n_head, T, head_dim)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2) # (B, n_kv_head, T, head_dim)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2) # (B, n_kv_head, T, head_dim)
 
-        start_pos = 0
+        start_pos = start_pos_offset
         if kv_cache is not None:
-            start_pos = kv_cache[0].shape[2]
+            # kv_cache[0].shape[2] represents the number of already cached tokens
+            start_pos += kv_cache[0].shape[2]
             
         # rotate queries and keys using their positions
         q = self._apply_rope(q, start_pos=start_pos)
         k = self._apply_rope(k, start_pos=start_pos)
 
         if kv_cache is not None:
-            # kv_cache is (torch.cat([prev_k, k]), torch.cat([prev_v, v]))
+            # kv_cache is (prev_k, prev_v)
             prev_k, prev_v = kv_cache
             k = torch.cat([prev_k, k], dim=2)
             v = torch.cat([prev_v, v], dim=2)
         
         new_kv_cache = (k, v)
         
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T_total) -> (B, nh, T, T_total)
-        # where T_total is T + len(prev_kv)
-        T_total = k.size(2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # repeat KV heads if n_kv_head < n_head
+        if self.n_kv_head != self.n_head:
+            n_rep = self.n_head // self.n_kv_head
+            # (B, n_kv_head, T_total, head_dim) -> (B, n_kv_head, n_rep, T_total, head_dim) -> (B, n_head, T_total, head_dim)
+            k = k[:, :, None, :, :].expand(B, self.n_kv_head, n_rep, k.size(2), self.head_dim).reshape(B, self.n_head, k.size(2), self.head_dim)
+            v = v[:, :, None, :, :].expand(B, self.n_kv_head, n_rep, v.size(2), self.head_dim).reshape(B, self.n_head, v.size(2), self.head_dim)
         
-        # Mask needs to be for (T, T_total)
-        # Original bias is (1, 1, block_size, block_size)
-        # For inference we usually use T=1.
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T_total) -> (B, nh, T, T_total)
+        T_total = k.size(2)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        
         if T > 1:
-            # Training or pre-fill
             mask = self.bias[:,:,start_pos:start_pos+T,:T_total]
             att = att.masked_fill(mask == 0, float('-inf'))
-        # If T=1 and we have cache, we don't strictly need masking because we only look back,
-        # but the bias buffer can still be used if we indexed it correctly.
-        # Actually, for T=1 it only attends to current and previous, which is already causal.
-        # But if start_pos=0 and T>1, it's the standard mask.
 
         att = F.softmax(att, dim=-1)
         y = att @ v # (B, nh, T, T_total) x (B, nh, T_total, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, self.n_embd) # re-assemble all head outputs side by side
 
         # output projection
         y = self.c_proj(y)
         return y, new_kv_cache
+
+class CrossAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.k_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.v_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, q, k, v):
+        B, Tq, C = q.size()
+        B, Tk, Ck = k.size()
+        
+        q = self.q_proj(q).view(B, Tq, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(k).view(B, Tk, self.n_head, self.head_dim).transpose(1, 2)
+        v = self.v_proj(v).view(B, Tk, self.n_head, self.head_dim).transpose(1, 2)
+        
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        att = F.softmax(att, dim=-1)
+        y = att @ v
+        y = y.transpose(1, 2).contiguous().view(B, Tq, C)
+        return self.c_proj(y)
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -168,23 +199,51 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
+        
+        if config.n_scratchpad > 0:
+            # Tokens query the scratchpad to "read" from memory
+            self.ln_read_tok = RMSNorm(config.n_embd)
+            self.ln_read_sp  = RMSNorm(config.n_embd)
+            self.read_attn = CrossAttention(config)
+            
+            # Scratchpad queries the tokens to "decide" what to write/update
+            self.ln_write_sp  = RMSNorm(config.n_embd)
+            self.ln_write_tok = RMSNorm(config.n_embd)
+            self.write_attn = CrossAttention(config)
+
         self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x, kv_cache=None):
-        attn_out, new_kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache)
+    def forward(self, x, scratchpad=None, kv_cache=None, start_pos_offset=0):
+        # 1. Self-Attention on tokens
+        attn_out, new_kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache, start_pos_offset=start_pos_offset)
         x = x + attn_out
+        
+        if scratchpad is not None:
+            # 2. Tokens read from Scratchpad
+            # Tokens are Q, Scratchpad is KV
+            x = x + self.read_attn(self.ln_read_tok(x), self.ln_read_sp(scratchpad), self.ln_read_sp(scratchpad))
+            
+            # 3. Scratchpad writes from Tokens
+            # Scratchpad is Q, Tokens are KV
+            # Use Tanh to squash the update if desired, or keep as residual
+            sp_update = self.write_attn(self.ln_write_sp(scratchpad), self.ln_write_tok(x), self.ln_write_tok(x))
+            scratchpad = scratchpad + sp_update
+
+        # 4. MLP on tokens
         x = x + self.mlp(self.ln_2(x))
-        return x, new_kv_cache
+        return x, scratchpad, new_kv_cache
 
 class TransformerConfig:
-    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_embd=384, n_scratchpad=64, rope_theta=10000.0):
+    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_kv_head=None, n_embd=384, n_scratchpad=64, rope_theta=10000.0):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_layer = n_layer
         self.n_head = n_head
+        self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
         self.n_embd = n_embd
         self.n_scratchpad = n_scratchpad
         self.rope_theta = rope_theta
@@ -222,48 +281,41 @@ class Transformer(nn.Module):
         device = idx.device
         b, t = idx.size()
         n_sp = self.config.n_scratchpad
+        start_pos_offset = n_sp if n_sp > 0 else 0
         
         if kv_caches is None:
+            # Prefill / Initial forward pass
             if t + n_sp > self.config.block_size:
                 t = self.config.block_size - n_sp
                 idx = idx[:, -t:]
                 if targets is not None:
                     targets = targets[:, -t:]
 
-            tok_emb = self.transformer.wte(idx) 
-            
+            x = self.transformer.wte(idx) 
             if n_sp > 0:
                 if scratchpad is None:
                     scratchpad = self.scratchpad_init.unsqueeze(0).expand(b, -1, -1)
-                x = torch.cat([scratchpad, tok_emb], dim=1)
-            else:
-                x = tok_emb
             kv_caches = [None] * len(self.transformer.h)
         else:
-            tok_emb = self.transformer.wte(idx)
-            x = tok_emb
+            # Incremental generation pass
+            # 'idx' is the new token, 'scratchpad' is recycled from the previous step
+            x = self.transformer.wte(idx)
+            if n_sp > 0 and scratchpad is None:
+                scratchpad = self.scratchpad_init.unsqueeze(0).expand(b, -1, -1)
 
         new_kv_caches = []
         for i, block in enumerate(self.transformer.h):
-            x, cache = block(x, kv_cache=kv_caches[i])
+            x, scratchpad, cache = block(x, scratchpad=scratchpad, kv_cache=kv_caches[i], start_pos_offset=start_pos_offset)
             new_kv_caches.append(cache)
             
         x = self.transformer.ln_f(x)
-        
-        if n_sp > 0 and (kv_caches[0] is None):
-            new_scratchpad = x[:, :n_sp, :]
-            logits_seq = x[:, n_sp:, :]
-        else:
-            new_scratchpad = None
-            logits_seq = x
-            
-        logits = self.lm_head(logits_seq)
+        logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
 
-        return logits, loss, new_scratchpad, new_kv_caches
+        return logits, loss, scratchpad, new_kv_caches
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):

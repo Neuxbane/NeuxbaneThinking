@@ -9,6 +9,7 @@ def inspect_model():
         block_size=512,
         n_layer=6,
         n_head=6,
+        n_kv_head=2,
         n_embd=384,
         n_scratchpad=64
     )
@@ -17,12 +18,13 @@ def inspect_model():
     model = Transformer(config)
     
     print("\n" + "="*50)
-    print("MODEL ARCHITECTURE INSPECTION")
+    print("MODEL ARCHITECTURE INSPECTION (GQA Support)")
     print("="*50)
     print(f"Vocab Size:      {config.vocab_size}")
     print(f"Block Size:      {config.block_size}")
     print(f"Layers:          {config.n_layer}")
     print(f"Heads:           {config.n_head}")
+    print(f"KV Heads:        {config.n_kv_head}")
     print(f"Embedding Dim:   {config.n_embd}")
     print(f"Scratchpad Size: {config.n_scratchpad}")
     print("-" * 50)
@@ -58,6 +60,18 @@ def inspect_model():
     if scratchpad is not None:
         print(f"  Scratchpad Shape: {scratchpad.shape} (Expected: [1, {config.n_scratchpad}, {config.n_embd}])")
     
+    # Run a generation test to verify KV caching and iterative forward
+    print("\nGeneration Verification (5 tokens):")
+    gen_tokens = 5
+    generated_idx = model.generate(dummy_input, max_new_tokens=gen_tokens)
+    
+    print(f"  Input Tokens:     {dummy_input.size(1)}")
+    print(f"  Generated Shape:  {generated_idx.shape} (Expected: [1, {10 + gen_tokens}])")
+    
+    # Try decoding a small segment
+    decoded = tokenizer.decode(generated_idx[0].tolist())
+    print(f"  Decoded Sample:   {repr(decoded[:50])}...")
+
     print("="*50)
 
 if __name__ == "__main__":
