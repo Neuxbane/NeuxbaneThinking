@@ -16,9 +16,11 @@ def inspect_model():
         n_head=6,
         n_kv_head=2,
         n_embd=384,
-        n_scratchpad=64
+        n_memory_slots=8,
+        n_active_slots=2,
+        n_slot_len=32
     )
-    
+
     # Initialize model without loading existing weights
     model = Transformer(config).to(device)
     
@@ -35,9 +37,9 @@ def inspect_model():
     print(f"Heads:           {config.n_head}")
     print(f"KV Heads:        {config.n_kv_head}")
     print(f"Embedding Dim:   {config.n_embd}")
-    print(f"Scratchpad Slots:{config.n_scratchpad}")
-    print(f"Scratchpad Dim:  {config.n_embd}")
-    print(f"Total Sp Params: {config.n_scratchpad * config.n_embd}")
+    print(f"Memory Pool:     {config.n_memory_slots} slots")
+    print(f"Active Memory:   {config.n_active_slots} slots @ {config.n_slot_len} length")
+    print(f"Total Sp Params: {config.n_memory_slots * config.n_slot_len * config.n_embd}")
     print("-" * 50)
     
     # Calculate parameters manualy to verify get_num_params()
@@ -63,7 +65,7 @@ def inspect_model():
 
     # Run a dummy forward pass to verify shapes
     dummy_input = torch.randint(0, config.vocab_size, (1, 10)).to(device)
-    logits, loss, _ = model(dummy_input)
+    logits, loss, _, _ = model(dummy_input)
     
     print("\nForward Pass Verification:")
     print(f"  Input Shape:      {dummy_input.shape}")
@@ -91,7 +93,7 @@ def inspect_model():
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
     
-    logits, loss, _ = model(train_input, targets=train_targets)
+    logits, loss, _, _ = model(train_input, targets=train_targets)
     print(f"  Forward Pass Loss: {loss.item():.4f}")
     
     loss.backward()

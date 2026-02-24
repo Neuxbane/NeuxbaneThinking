@@ -253,7 +253,7 @@ def main():
             x, y = x.to(device), y.to(device)
             
             try:
-                logits, loss, _ = model(x, y)
+                logits, loss, _, _ = model(x, y)
             except Exception as e:
                 # Catch OOM during lazy compilation or first forward/backward pass
                 if is_compiled and ("CUDA error: out of memory" in str(e) or "BackendCompilerFailed" in str(e)):
@@ -263,7 +263,7 @@ def main():
                     is_compiled = False
                     # Clear cache and retry step with original model
                     torch.cuda.empty_cache()
-                    logits, loss, _ = model(x, y)
+                    logits, loss, _, _ = model(x, y)
                 else:
                     raise e
             

@@ -79,7 +79,9 @@ class CausalSelfAttention(nn.Module):
         
         # RoPE precomputation
         # Total effective sequence length must include the prefix scratchpad
-        effective_block_size = config.block_size + config.n_scratchpad
+        # Using active memory slots as the effective scratchpad
+        n_sp = config.n_active_slots * config.n_slot_len
+        effective_block_size = config.block_size + n_sp
         inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
         t = torch.arange(effective_block_size).float()
         freqs = torch.outer(t, inv_freq) # (effective_block_size, head_dim // 2)
@@ -170,31 +172,73 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, use_memory_read=False):
         super().__init__()
         self.config = config
         self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
+        self.memory_read = MemoryRead(config) if use_memory_read else None
 
-    def forward(self, x, kv_cache=None, start_pos_offset=0):
+    def forward(self, x, kv_cache=None, start_pos_offset=0, memory_pool=None):
         # Self-Attention handles prefix memory naturally via causal mask if prepended
         attn_out, new_kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache, start_pos_offset=start_pos_offset)
         x = x + attn_out
+        
+        if self.memory_read is not None:
+            x = self.memory_read(x, memory_pool)
+            
         x = x + self.mlp(self.ln_2(x))
         return x, new_kv_cache
 
+class MemoryRead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.ln = RMSNorm(config.n_embd)
+        self.head_dim = config.n_embd // config.n_head
+        self.n_head = config.n_head
+        
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.kv_proj = nn.Linear(config.n_embd, 2 * config.n_embd, bias=False)
+        self.out_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x, memory_pool):
+        if memory_pool is None:
+            return x
+        
+        b, t, c = x.size()
+        m_slots, m_len, _ = memory_pool.size()
+        
+        # Flatten memory for K, V
+        mem = memory_pool.view(1, m_slots * m_len, c).expand(b, -1, -1)
+        
+        q = self.q_proj(self.ln(x)).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
+        kv = self.kv_proj(mem).view(b, m_slots * m_len, 2, self.n_head, self.head_dim)
+        k = kv[:, :, 0, :, :].transpose(1, 2) 
+        v = kv[:, :, 1, :, :].transpose(1, 2) 
+        
+        # Cross-attention (no causal mask since it's memory)
+        y = F.scaled_dot_product_attention(q, k, v)
+        
+        y = y.transpose(1, 2).contiguous().view(b, t, c)
+        return x + self.out_proj(y)
+
 class TransformerConfig:
-    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_kv_head=None, n_embd=384, n_scratchpad=64, rope_theta=10000.0):
+    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_kv_head=None, n_embd=384, 
+                 n_memory_slots=8, n_slot_len=32, n_active_slots=2, rope_theta=10000.0, router_temp=1.0):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
         self.n_embd = n_embd
-        self.n_scratchpad = n_scratchpad
+        self.n_memory_slots = n_memory_slots
+        self.n_slot_len = n_slot_len
+        self.n_active_slots = n_active_slots
         self.rope_theta = rope_theta
+        self.router_temp = router_temp
 
 class Transformer(nn.Module):
     def __init__(self, config):
@@ -203,16 +247,24 @@ class Transformer(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, use_memory_read=(i % 2 == 1)) for i in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        if config.n_scratchpad > 0:
-            # Prefix memory initialization state
-            self.scratchpad_init = nn.Parameter(torch.randn(config.n_scratchpad, config.n_embd) * 0.02)
+        if config.n_memory_slots > 0:
+            # Initialization for memory pool and lookup keys
+            self.memory_pool = nn.Parameter(torch.randn(config.n_memory_slots, config.n_slot_len, config.n_embd) * 0.02)
+            self.memory_keys = nn.Parameter(torch.randn(config.n_memory_slots, config.n_embd) * 0.02)
+            
+            # Dynamic Update Head (The "Write" mechanism)
+            # We update the KV cache directly, so we need slots * (K + V) * kv_heads * head_dim
+            head_dim = config.n_embd // config.n_head
+            self.memory_updater = nn.Linear(config.n_embd, config.n_active_slots * 2 * config.n_kv_head * head_dim)
+            # Predicts a "Write-Gate" alpha for each active slot
+            self.memory_gate = nn.Linear(config.n_embd, config.n_active_slots)
         else:
-            self.scratchpad_init = None
+            self.memory_pool = None
 
         # weight tying
         self.transformer.wte.weight = self.lm_head.weight
@@ -226,10 +278,12 @@ class Transformer(nn.Module):
         n_params -= self.transformer.wte.weight.numel()
         return n_params
 
-    def forward(self, idx, targets=None, kv_caches=None):
+    def forward(self, idx, targets=None, kv_caches=None, active_indices=None):
         device = idx.device
         b, t = idx.size()
-        n_sp = self.config.n_scratchpad
+        
+        # Effective n_sp for RoPE/mask indices
+        n_sp = self.config.n_active_slots * self.config.n_slot_len
         
         if kv_caches is None:
             # Prefill / Initial forward pass
@@ -241,8 +295,29 @@ class Transformer(nn.Module):
 
             x = self.transformer.wte(idx) 
             if n_sp > 0:
-                # Prepend the scratchpad tokens as "Prefix Memory"
-                prefix = self.scratchpad_init.unsqueeze(0).expand(b, -1, -1)
+                # Top-K Scratchpad Routing
+                # Match current sequence mean embedding against the memory pool's keys
+                query = x.mean(dim=1) # (b, n_embd)
+                
+                # similarity scores: (b, n_memory_slots)
+                sim = torch.matmul(query, self.memory_keys.t())
+                
+                if self.training:
+                    # Soft Routing during training for exploration/gradients
+                    probs = torch.softmax(sim / self.config.router_temp, dim=-1)
+                    # Weighted sum of all slots: (b, n_slot_len, n_embd)
+                    soft_prefix = (probs.view(b, -1, 1, 1) * self.memory_pool.unsqueeze(0)).sum(dim=1)
+                    # Expand to match n_active_slots for sequence length consistency
+                    selected_slots = soft_prefix.unsqueeze(1).repeat(1, self.config.n_active_slots, 1, 1)
+                    _, active_indices = torch.topk(sim, self.config.n_active_slots, dim=-1)
+                else:
+                    # Pick the most relevant TOP memory slots
+                    _, active_indices = torch.topk(sim, self.config.n_active_slots, dim=-1) # (b, n_active_slots)
+                    selected_slots = self.memory_pool[active_indices] 
+                
+                # prefix: (b, n_sp, n_embd)
+                prefix = selected_slots.contiguous().view(b, n_sp, self.config.n_embd)
+                
                 x = torch.cat([prefix, x], dim=1)
                 if targets is not None:
                     # Offset targets to align with sequence tokens
@@ -255,17 +330,51 @@ class Transformer(nn.Module):
 
         new_kv_caches = []
         for i, block in enumerate(self.transformer.h):
-            x, cache = block(x, kv_cache=kv_caches[i], start_pos_offset=0)
+            x, cache = block(x, kv_cache=kv_caches[i], start_pos_offset=0, memory_pool=self.memory_pool)
             new_kv_caches.append(cache)
             
-        x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
+        x_post = self.transformer.ln_f(x)
+        logits = self.lm_head(x_post)
+
+        # --- Dynamic Memory Update (Write-Back) ---
+        # At each step, update the "Active Scratchpad" (Prefix KV) using current thoughts
+        if self.config.n_memory_slots > 0 and active_indices is not None and t == 1:
+            current_h = x_post[:, -1, :] # (b, n_embd)
+            head_dim = self.config.n_embd // self.config.n_head
+            
+            # Predict update and update gate for each active slot
+            # UPDATED: Predicts both K and V updates
+            updates = self.memory_updater(current_h).view(b, self.config.n_active_slots, 2, self.config.n_kv_head, head_dim)
+            k_up = updates[:, :, 0, :, :]
+            v_up = updates[:, :, 1, :, :]
+            gates = torch.sigmoid(self.memory_gate(current_h)).view(b, self.config.n_active_slots, 1)
+            
+            for i in range(len(self.transformer.h)):
+                k, v = new_kv_caches[i]
+                # Update the K and V of the prefix section (first n_sp tokens)
+                prefix_k = k[:, :, :n_sp, :].clone().view(b, self.config.n_kv_head, self.config.n_active_slots, self.config.n_slot_len, head_dim)
+                prefix_v = v[:, :, :n_sp, :].clone().view(b, self.config.n_kv_head, self.config.n_active_slots, self.config.n_slot_len, head_dim)
+                
+                # Expand updates to match heads and slot length
+                k_update = k_up.transpose(1, 2).unsqueeze(3)
+                v_update = v_up.transpose(1, 2).unsqueeze(3)
+                g = gates.view(b, 1, self.config.n_active_slots, 1, 1)
+                
+                # Recurrent update for both K and V
+                prefix_k = (1 - g) * prefix_k + g * k_update
+                prefix_v = (1 - g) * prefix_v + g * v_update
+                
+                # Re-integrate into cache
+                prefix_k = prefix_k.view(b, self.config.n_kv_head, n_sp, head_dim)
+                prefix_v = prefix_v.view(b, self.config.n_kv_head, n_sp, head_dim)
+                new_kv_caches[i] = (torch.cat([prefix_k, k[:, :, n_sp:, :]], dim=2), 
+                                   torch.cat([prefix_v, v[:, :, n_sp:, :]], dim=2))
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
 
-        return logits, loss, new_kv_caches
+        return logits, loss, new_kv_caches, active_indices
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -275,10 +384,11 @@ class Transformer(nn.Module):
         """
         full_idx = idx
         kv_caches = None
+        active_indices = None
 
         for _ in range(max_new_tokens):
             # forward the model to get the logits for the index in the sequence
-            logits, _, kv_caches = self(idx, kv_caches=kv_caches)
+            logits, _, kv_caches, active_indices = self(idx, kv_caches=kv_caches, active_indices=active_indices)
             # pluck the logits at the final step and scale by desired temperature
             logits_step = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
