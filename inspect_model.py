@@ -4,7 +4,8 @@ from gpu_utils import set_device
 
 def inspect_model():
     # Set the device using the utility script
-    device, device_name = set_device(min_memory_gb=1.0)
+    # Require 4.0GB to avoid nearly-full GPUs which often lead to OOM
+    device, device_name = set_device(min_memory_gb=4.0)
     
     # Use the same configuration as in train.py
     tokenizer = ByteTokenizer()

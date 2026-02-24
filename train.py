@@ -11,12 +11,12 @@ import sys
 import random
 
 dataset_samplings = {
-    "claude-4.5-high-reasoning": 100,
-    "dolci_think": 100,
-    "tiny_think":100,
-    "medical-reasoning": 100,
-    "glaive-function-calling-v2-query": 100,
-    "ToolACE-query": 100,
+    "claude-4.5-high-reasoning": -1,
+    "dolci_think": -1,
+    "tiny_think":-1,
+    "medical-reasoning": 1000,
+    "glaive-function-calling-v2-query": 1000,
+    "ToolACE-query": 1000,
 }
 
 # --- Dataset ---
@@ -162,17 +162,19 @@ def save_model(model, path="model.pth"):
         print(f"\n[GPU Memory] Current Allocated: {allocated:.2f} GB | Reserved: {reserved:.2f} GB | Peak: {max_allocated:.2f} GB")
 
     print(f"Saving model to {path}...")
-    torch.save(model.state_dict(), path)
+    # Strip torch.compile wrapper if present to save clean state_dict
+    state_dict = model.state_dict()
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    
+    torch.save(state_dict, path)
 
 def main():
     # Setup
-    # Require 2.0GB to avoid nearly-full GPUs which often lead to OOM later in training.
-    device, device_name = set_device(min_memory_gb=2.0)
     data_dir = "datasets"
-    
     tokenizer = ByteTokenizer()
-    print(f"Vocab size: {tokenizer.vocab_size}")
-
+    
+    # Configuration
     config = TransformerConfig(
         vocab_size=tokenizer.vocab_size,
         block_size=512,
@@ -180,6 +182,15 @@ def main():
         n_head=6,
         n_embd=384
     )
+
+    # --- Loading Dataset FIRST (High CPU/Memory, No GPU) ---
+    print(f"Vocab size: {tokenizer.vocab_size}")
+    print(f"Loading data from {data_dir}...")
+    dataset = JSONLDataset(data_dir, tokenizer, config.block_size, samplings=dataset_samplings)
+    dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+    
+    # --- NOW claim GPU (Secure memory just before initializing model) ---
+    device, device_name = set_device(min_memory_gb=4.0)
     
     model = Transformer(config).to(device)
     
@@ -189,6 +200,11 @@ def main():
         print(f"Loading existing model from {checkpoint_path}")
         try:
             state = torch.load(checkpoint_path, map_location=device)
+            # Remove _orig_mod. prefix if present from previous torch.compile saves
+            if any(k.startswith("_orig_mod.") for k in state.keys()):
+                print("Note: Striping '_orig_mod.' prefix from checkpoint keys.")
+                state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+                
             try:
                 model.load_state_dict(state)
                 print("Checkpoint loaded (strict match). Continuing training from checkpoint.")
@@ -205,20 +221,23 @@ def main():
             print(f"Error loading checkpoint file: {e}")
             print("Proceeding to train with newly initialized model.")
 
-    dataset = JSONLDataset(data_dir, tokenizer, config.block_size, samplings=dataset_samplings)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4)
     # Use torch.compile to speed up the model (especially with Flash Attention)
     try:
         print("Compiling model for performance...")
+        # Keep original model for fallback if compilation results in OOM during execution
+        uncompiled_model = model
         model = torch.compile(model)
+        is_compiled = True
     except Exception as e:
-        print(f"torch.compile failed or not supported: {e}")
+        print(f"torch.compile failed early or not supported: {e}")
+        uncompiled_model = model
+        is_compiled = False
 
     # Signal handler for immediate save
     def signal_handler(sig, frame):
-        save_model(model, checkpoint_path)
+        # Save the raw model (uncompiled state_dict)
+        save_model(uncompiled_model, checkpoint_path)
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -233,7 +252,20 @@ def main():
         for step, (x, y) in enumerate(dataloader):
             x, y = x.to(device), y.to(device)
             
-            logits, loss, _ = model(x, y)
+            try:
+                logits, loss, _ = model(x, y)
+            except Exception as e:
+                # Catch OOM during lazy compilation or first forward/backward pass
+                if is_compiled and ("CUDA error: out of memory" in str(e) or "BackendCompilerFailed" in str(e)):
+                    print(f"\n[!] torch.compile failed during execution: {e}")
+                    print("Falling back to uncompiled model for stability.")
+                    model = uncompiled_model
+                    is_compiled = False
+                    # Clear cache and retry step with original model
+                    torch.cuda.empty_cache()
+                    logits, loss, _ = model(x, y)
+                else:
+                    raise e
             
             optimizer.zero_grad()
             loss.backward()

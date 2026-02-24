@@ -37,6 +37,8 @@ def stream_generate(model, tokenizer, prompt, max_new_tokens=4096, temperature=0
 
 
 def main():
+    # Setup
+    # Require 4.0GB to avoid nearly-full GPUs which often lead to OOM later in training.
     device, _ = set_device(min_memory_gb=2.0)
     tokenizer = ByteTokenizer()
     
@@ -56,6 +58,11 @@ def main():
         # Prefer strict loading, but gracefully fall back to non-strict or fresh init
         try:
             state = torch.load(checkpoint_path, map_location=device)
+            # Remove _orig_mod. prefix if present from previous torch.compile saves
+            if any(k.startswith("_orig_mod.") for k in state.keys()):
+                print("Note: Striping '_orig_mod.' prefix from checkpoint keys.")
+                state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+                
             try:
                 model.load_state_dict(state)
                 print("Checkpoint loaded (strict match).")
