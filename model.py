@@ -196,7 +196,8 @@ class MemoryRead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.ln = RMSNorm(config.n_embd)
+        self.ln_in = RMSNorm(config.n_embd)
+        self.ln_out = RMSNorm(config.n_embd)
         self.head_dim = config.n_embd // config.n_head
         self.n_head = config.n_head
         
@@ -214,7 +215,7 @@ class MemoryRead(nn.Module):
         # Flatten memory for K, V
         mem = memory_pool.view(1, m_slots * m_len, c).expand(b, -1, -1)
         
-        q = self.q_proj(self.ln(x)).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
+        q = self.q_proj(self.ln_in(x)).view(b, t, self.n_head, self.head_dim).transpose(1, 2)
         kv = self.kv_proj(mem).view(b, m_slots * m_len, 2, self.n_head, self.head_dim)
         k = kv[:, :, 0, :, :].transpose(1, 2) 
         v = kv[:, :, 1, :, :].transpose(1, 2) 
@@ -223,11 +224,12 @@ class MemoryRead(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v)
         
         y = y.transpose(1, 2).contiguous().view(b, t, c)
-        return x + self.out_proj(y)
+        return x + self.ln_out(self.out_proj(y))
 
 class TransformerConfig:
     def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_kv_head=None, n_embd=384, 
-                 n_memory_slots=8, n_slot_len=32, n_active_slots=2, rope_theta=10000.0, router_temp=1.0):
+                 n_memory_slots=64, n_slot_len=128, n_active_slots=8, rope_theta=10000.0, router_temp=1.0,
+                 use_delta_rule=True):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_layer = n_layer
@@ -239,6 +241,7 @@ class TransformerConfig:
         self.n_active_slots = n_active_slots
         self.rope_theta = rope_theta
         self.router_temp = router_temp
+        self.use_delta_rule = use_delta_rule
 
 class Transformer(nn.Module):
     def __init__(self, config):
@@ -247,21 +250,25 @@ class Transformer(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            h = nn.ModuleList([Block(config, use_memory_read=(i % 2 == 1)) for i in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, use_memory_read=(i % 3 == 2)) for i in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         if config.n_memory_slots > 0:
-            # Initialization for memory pool and lookup keys
-            self.memory_pool = nn.Parameter(torch.randn(config.n_memory_slots, config.n_slot_len, config.n_embd) * 0.02)
+            # initialization for memory pool and lookup keys
+            # Using learned constants for better memory startup (Zero-init with bias or small noise)
+            self.memory_pool = nn.Parameter(torch.zeros(config.n_memory_slots, config.n_slot_len, config.n_embd))
+            self.memory_pos_emb = nn.Parameter(torch.randn(1, config.n_slot_len, config.n_embd) * 0.02)
             self.memory_keys = nn.Parameter(torch.randn(config.n_memory_slots, config.n_embd) * 0.02)
             
+            # Query-based Routing (Instead of just x.mean())
+            self.router_query_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+            self.router_ln = RMSNorm(config.n_embd)
+            
             # Dynamic Update Head (The "Write" mechanism)
-            # We update the KV cache directly, so we need slots * (K + V) * kv_heads * head_dim
             head_dim = config.n_embd // config.n_head
             self.memory_updater = nn.Linear(config.n_embd, config.n_active_slots * 2 * config.n_kv_head * head_dim)
-            # Predicts a "Write-Gate" alpha for each active slot
             self.memory_gate = nn.Linear(config.n_embd, config.n_active_slots)
         else:
             self.memory_pool = None
@@ -278,7 +285,7 @@ class Transformer(nn.Module):
         n_params -= self.transformer.wte.weight.numel()
         return n_params
 
-    def forward(self, idx, targets=None, kv_caches=None, active_indices=None):
+    def forward(self, idx, targets=None, kv_caches=None, active_indices=None, is_thinking=None):
         device = idx.device
         b, t = idx.size()
         
@@ -297,23 +304,24 @@ class Transformer(nn.Module):
             if n_sp > 0:
                 # Top-K Scratchpad Routing
                 # Match current sequence mean embedding against the memory pool's keys
-                query = x.mean(dim=1) # (b, n_embd)
+                query = self.router_ln(self.router_query_proj(x.mean(dim=1))) # (b, n_embd)
                 
                 # similarity scores: (b, n_memory_slots)
                 sim = torch.matmul(query, self.memory_keys.t())
                 
+                base_mem = self.memory_pool + self.memory_pos_emb
                 if self.training:
                     # Soft Routing during training for exploration/gradients
                     probs = torch.softmax(sim / self.config.router_temp, dim=-1)
                     # Weighted sum of all slots: (b, n_slot_len, n_embd)
-                    soft_prefix = (probs.view(b, -1, 1, 1) * self.memory_pool.unsqueeze(0)).sum(dim=1)
+                    soft_prefix = (probs.view(b, -1, 1, 1) * base_mem.unsqueeze(0)).sum(dim=1)
                     # Expand to match n_active_slots for sequence length consistency
                     selected_slots = soft_prefix.unsqueeze(1).repeat(1, self.config.n_active_slots, 1, 1)
                     _, active_indices = torch.topk(sim, self.config.n_active_slots, dim=-1)
                 else:
                     # Pick the most relevant TOP memory slots
                     _, active_indices = torch.topk(sim, self.config.n_active_slots, dim=-1) # (b, n_active_slots)
-                    selected_slots = self.memory_pool[active_indices] 
+                    selected_slots = base_mem[active_indices] 
                 
                 # prefix: (b, n_sp, n_embd)
                 prefix = selected_slots.contiguous().view(b, n_sp, self.config.n_embd)
@@ -338,17 +346,37 @@ class Transformer(nn.Module):
 
         # --- Dynamic Memory Update (Write-Back) ---
         # At each step, update the "Active Scratchpad" (Prefix KV) using current thoughts
-        if self.config.n_memory_slots > 0 and active_indices is not None and t == 1:
+        # Interleaved Thinking: Only update when is_thinking is True
+        should_update = (self.config.n_memory_slots > 0 and 
+                        active_indices is not None and 
+                        t == 1 and 
+                        (is_thinking is None or is_thinking.any()))
+        
+        if should_update:
             current_h = x_post[:, -1, :] # (b, n_embd)
             head_dim = self.config.n_embd // self.config.n_head
             
-            # Predict update and update gate for each active slot
-            # UPDATED: Predicts both K and V updates
             updates = self.memory_updater(current_h).view(b, self.config.n_active_slots, 2, self.config.n_kv_head, head_dim)
             k_up = updates[:, :, 0, :, :]
             v_up = updates[:, :, 1, :, :]
-            gates = torch.sigmoid(self.memory_gate(current_h)).view(b, self.config.n_active_slots, 1)
             
+            # Predict a gate for each active slot
+            raw_gates = self.memory_gate(current_h) # (b, n_active_slots)
+            
+            # Sparse Update: Only update the top-k most relevant active slots
+            # This prevents gradients from washing out across all slots.
+            k_sparse = max(1, self.config.n_active_slots // 2)
+            top_gates, top_indices = torch.topk(raw_gates, k_sparse, dim=-1)
+            
+            # Create a sparse gate mask
+            sparse_mask = torch.zeros_like(raw_gates).scatter_(-1, top_indices, 1.0)
+            gates = torch.sigmoid(raw_gates) * sparse_mask
+            gates = gates.view(b, self.config.n_active_slots, 1)
+            
+            # Mask based on is_thinking if provided
+            if is_thinking is not None:
+                gates = gates * is_thinking.view(b, 1, 1).float()
+
             for i in range(len(self.transformer.h)):
                 k, v = new_kv_caches[i]
                 # Update the K and V of the prefix section (first n_sp tokens)
@@ -360,9 +388,14 @@ class Transformer(nn.Module):
                 v_update = v_up.transpose(1, 2).unsqueeze(3)
                 g = gates.view(b, 1, self.config.n_active_slots, 1, 1)
                 
-                # Recurrent update for both K and V
-                prefix_k = (1 - g) * prefix_k + g * k_update
-                prefix_v = (1 - g) * prefix_v + g * v_update
+                if self.config.use_delta_rule:
+                    # Delta Rule: error = update - current, current = current + g * error
+                    prefix_k = prefix_k + g * (k_update - prefix_k)
+                    prefix_v = prefix_v + g * (v_update - prefix_v)
+                else:
+                    # Recurrent update for both K and V
+                    prefix_k = (1 - g) * prefix_k + g * k_update
+                    prefix_v = (1 - g) * prefix_v + g * v_update
                 
                 # Re-integrate into cache
                 prefix_k = prefix_k.view(b, self.config.n_kv_head, n_sp, head_dim)
@@ -385,10 +418,22 @@ class Transformer(nn.Module):
         full_idx = idx
         kv_caches = None
         active_indices = None
+        
+        # Track whether the model is in thinking mode (starting with the last token's state)
+        # 256: <think>, 257: </think>
+        is_thinking = torch.zeros(idx.size(0), dtype=torch.bool, device=idx.device)
+        for b_idx in range(idx.size(0)):
+            # Find the last <think> or </think> in the input
+            think_pos = (idx[b_idx] == 256).nonzero(as_tuple=True)[0]
+            unthink_pos = (idx[b_idx] == 257).nonzero(as_tuple=True)[0]
+            last_think = think_pos[-1] if len(think_pos) > 0 else -1
+            last_unthink = unthink_pos[-1] if len(unthink_pos) > 0 else -1
+            if last_think > last_unthink:
+                is_thinking[b_idx] = True
 
         for _ in range(max_new_tokens):
             # forward the model to get the logits for the index in the sequence
-            logits, _, kv_caches, active_indices = self(idx, kv_caches=kv_caches, active_indices=active_indices)
+            logits, _, kv_caches, active_indices = self(idx, kv_caches=kv_caches, active_indices=active_indices, is_thinking=is_thinking)
             # pluck the logits at the final step and scale by desired temperature
             logits_step = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -399,6 +444,14 @@ class Transformer(nn.Module):
             probs = F.softmax(logits_step, dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Update thinking state based on the token that will be passed in next
+            for b_idx in range(idx.size(0)):
+                if idx_next[b_idx] == 256:
+                    is_thinking[b_idx] = True
+                elif idx_next[b_idx] == 257:
+                    is_thinking[b_idx] = False
+            
             # append sampled index to the running sequence and continue
             full_idx = torch.cat((full_idx, idx_next), dim=1)
             idx = idx_next
