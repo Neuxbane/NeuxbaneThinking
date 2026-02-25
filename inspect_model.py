@@ -14,7 +14,7 @@ def generate_random_batch(batch_size, seq_len, vocab_size, device):
     return input_ids, targets
 
 def analyze_speed(model, config, device):
-    batch_size = 4
+    batch_size = 2 # Reduced from 4 to avoid OOM in tight environments
     seq_len = config.block_size
     
     print("\n" + "="*50)
@@ -91,15 +91,16 @@ def inspect_model():
 
     # Use the same configuration as in train.py
     tokenizer = ByteTokenizer()
-    # Try to match model.pth if possible, otherwise use default
+    # Updated configuration for Multi-Page Routed Scratchpad
     config = TransformerConfig(
         vocab_size=tokenizer.vocab_size,
         block_size=512,
         n_layer=6,
         n_head=6,
-        n_kv_head=6, # Adjusted to match model.pth (was 2)
+        n_kv_head=6,
         n_embd=384,
-        n_scratchpad=64
+        n_scratchpad=512,    # Capacity per scratchpad
+        num_scratchpads=4    # Number of scratchpad pages
     )
     
     # Initialize model
@@ -158,6 +159,7 @@ def inspect_model():
     params_with_grad = [name for name, p in trainable_params if p.grad is not None]
     params_without_grad = [name for name, p in trainable_params if p.grad is None]
     
+    has_grad = len(params_without_grad) == 0
     if not has_grad:
         print(f"  [MISSING GRADIENTS] {len(params_without_grad)} items: {params_without_grad[:5]}...")
         print("  NOTE: Missing gradients in the last layer's 'write' heads are expected,")

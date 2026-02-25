@@ -211,6 +211,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         
         if config.n_scratchpad > 0:
+            # Routing mechanism to pick which scratchpads to use
+            self.router = nn.Linear(config.n_embd, config.num_scratchpads, bias=False)
+            
             # Tokens query the scratchpad to "read" from memory
             self.ln_read_tok = RMSNorm(config.n_embd)
             self.ln_read_sp  = RMSNorm(config.n_embd)
@@ -234,25 +237,60 @@ class Block(nn.Module):
         x = x + attn_out
         
         if scratchpad is not None:
+            # Routing: Pick top-2 scratchpad pages based on token representation
+            # We use a summary of tokens (mean) for routing decisions
+            B, T, C = x.shape
+            x_summary = x.mean(dim=1)
+            router_logits = self.router(x_summary) # (B, num_scratchpads)
+            
+            # Use softmax weights to ensure the router is trainable (MoE style)
+            # We'll apply these weights to the selected pages to propagate gradients
+            router_probs = F.softmax(router_logits, dim=-1) # (B, num_scratchpads)
+            top_probs, top_indices = torch.topk(router_probs, 2, dim=-1) # (B, 2)
+            
+            # Normalize top_probs so they sum to 1
+            top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
+            
+            # Gather the selected pages
+            batch_indices = torch.arange(B, device=x.device)[:, None]
+            # scratchpad shape: (B, num_pages, n_sp, n_embd)
+            selected_sp = scratchpad[batch_indices, top_indices] # (B, 2, n_sp, n_embd)
+            
+            # Apply routing weights to propagate gradients to the router
+            selected_sp = selected_sp * top_probs.view(B, 2, 1, 1)
+            
+            # Flatten context for attention
+            n_sp = self.config.n_scratchpad
+            flat_sp = selected_sp.view(B, 2 * n_sp, C)
+            
             # 2. Tokens read from Scratchpad
-            # Tokens are Q, Scratchpad is KV
-            x = x + self.read_attn(self.ln_read_tok(x), self.ln_read_sp(scratchpad), self.ln_read_sp(scratchpad))
+            # Tokens are Q, Selected Scratchpad is KV
+            x = x + self.read_attn(self.ln_read_tok(x), self.ln_read_sp(flat_sp), self.ln_read_sp(flat_sp))
             
             # 3. Scratchpad writes from Tokens
             # Scratchpad is Q, Tokens are KV
-            # Gated Update (like a simplified GRU/LSTM gate)
-            raw_update = self.write_attn(self.ln_write_sp(scratchpad), self.ln_write_tok(x), self.ln_write_tok(x))
+            raw_update = self.write_attn(self.ln_write_sp(flat_sp), self.ln_write_tok(x), self.ln_write_tok(x))
             
-            gate = torch.sigmoid(self.sp_gate(torch.cat([scratchpad, raw_update], dim=-1)))
+            gate = torch.sigmoid(self.sp_gate(torch.cat([flat_sp, raw_update], dim=-1)))
             candidate = torch.tanh(self.sp_update_proj(raw_update))
-            scratchpad = (1 - gate) * scratchpad + gate * candidate
+            flat_sp = (1 - gate) * flat_sp + gate * candidate
+            
+            # Reshape back and scatter into original scratchpad
+            new_selected_sp = flat_sp.view(B, 2, n_sp, C)
+            
+            # Since scratchpad is updated in-place (conceptually, we return the new one)
+            # We create a clone or modified version. In the forward loop, we'll return it.
+            # Due to python reference, we need to be careful.
+            new_scratchpad = scratchpad.clone()
+            new_scratchpad[batch_indices, top_indices] = new_selected_sp
+            scratchpad = new_scratchpad
 
         # 4. MLP on tokens
         x = x + self.mlp(self.ln_2(x))
         return x, scratchpad, new_kv_cache
 
 class TransformerConfig:
-    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_kv_head=None, n_embd=384, n_scratchpad=64, rope_theta=10000.0):
+    def __init__(self, vocab_size=256, block_size=512, n_layer=6, n_head=6, n_kv_head=None, n_embd=384, n_scratchpad=512, num_scratchpads=4, rope_theta=10000.0):
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.n_layer = n_layer
@@ -260,6 +298,7 @@ class TransformerConfig:
         self.n_kv_head = n_kv_head if n_kv_head is not None else n_head
         self.n_embd = n_embd
         self.n_scratchpad = n_scratchpad
+        self.num_scratchpads = num_scratchpads
         self.rope_theta = rope_theta
 
 class Transformer(nn.Module):
@@ -275,9 +314,9 @@ class Transformer(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         if config.n_scratchpad > 0:
-            # Memory initialization state
-            self.scratchpad_init = nn.Parameter(torch.randn(config.n_scratchpad, config.n_embd) * 0.02)
-            # Learnable positional embeddings for memory slots to give them distinct indices/identities
+            # Memory initialization state (per page)
+            self.scratchpad_init = nn.Parameter(torch.randn(config.num_scratchpads, config.n_scratchpad, config.n_embd) * 0.02)
+            # Learnable positional embeddings for memory slots to give them distinct indices/identities within a page
             self.scratchpad_pos = nn.Parameter(torch.randn(config.n_scratchpad, config.n_embd) * 0.02)
         else:
             self.scratchpad_init = None
@@ -313,13 +352,14 @@ class Transformer(nn.Module):
             if n_sp > 0:
                 if scratchpad is None:
                     # Initialize with both base state and slot-specific positional info
-                    scratchpad = (self.scratchpad_init + self.scratchpad_pos).unsqueeze(0).expand(b, -1, -1)
+                    # Result shape: (B, num_scratchpads, n_scratchpad, n_embd)
+                    scratchpad = (self.scratchpad_init + self.scratchpad_pos).unsqueeze(0).expand(b, -1, -1, -1)
             kv_caches = [None] * len(self.transformer.h)
         else:
             # Incremental generation pass
             x = self.transformer.wte(idx)
             if n_sp > 0 and scratchpad is None:
-                scratchpad = (self.scratchpad_init + self.scratchpad_pos).unsqueeze(0).expand(b, -1, -1)
+                scratchpad = (self.scratchpad_init + self.scratchpad_pos).unsqueeze(0).expand(b, -1, -1, -1)
 
         new_kv_caches = []
         for i, block in enumerate(self.transformer.h):
