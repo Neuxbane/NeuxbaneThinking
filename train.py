@@ -155,10 +155,11 @@ def save_model(model, path="model.pth"):
 
 def main():
     # Setup
-    # Require 2.0GB to avoid nearly-full GPUs which often lead to OOM later in training.
-    device, device_name = set_device(min_memory_gb=2.0)
+    # NOTE: Delay GPU selection until AFTER data is loaded to avoid reserving GPU
+    # while performing potentially heavy CPU-side dataset loading. Create model
+    # on CPU, load data, then allocate GPU and move model there.
     data_dir = "datasets"
-    
+
     tokenizer = ByteTokenizer()
     print(f"Vocab size: {tokenizer.vocab_size}")
 
@@ -170,14 +171,16 @@ def main():
         n_embd=384
     )
     
-    model = Transformer(config).to(device)
+    # Create model on CPU first to avoid early GPU allocations
+    cpu_device = torch.device('cpu')
+    model = Transformer(config).to(cpu_device)
     
-    # Load existing model
+    # Load existing model (into CPU first)
     checkpoint_path = "model.pth"
     if os.path.exists(checkpoint_path):
         print(f"Loading existing model from {checkpoint_path}")
         try:
-            state = torch.load(checkpoint_path, map_location=device)
+            state = torch.load(checkpoint_path, map_location=cpu_device)
             try:
                 model.load_state_dict(state)
                 print("Checkpoint loaded (strict match). Continuing training from checkpoint.")
@@ -195,7 +198,18 @@ def main():
             print("Proceeding to train with newly initialized model.")
 
     dataset = JSONLDataset(data_dir, tokenizer, config.block_size, samplings=dataset_samplings)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+    # Now that data is loaded, select the device and move model there. This
+    # prevents holding GPU resources while parsing/loading datasets.
+    device, device_name = set_device(min_memory_gb=4.0)
+    print(f"Using device: {device_name}")
+
+    # Move model to chosen device
+    model = model.to(device)
+
+    # Use pin_memory for faster host->device transfers when using CUDA
+    pin_memory = True if device.type == 'cuda' else False
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, pin_memory=pin_memory)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4)
 
@@ -214,7 +228,9 @@ def main():
         model.train()
         total_loss = 0
         for step, (x, y) in enumerate(dataloader):
-            x, y = x.to(device), y.to(device)
+            # Use non_blocking transfer when pin_memory is enabled
+            x = x.to(device, non_blocking=True) if pin_memory else x.to(device)
+            y = y.to(device, non_blocking=True) if pin_memory else y.to(device)
             
             logits, loss, _, _ = model(x, y)
             

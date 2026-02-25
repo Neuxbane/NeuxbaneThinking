@@ -7,7 +7,7 @@ from gpu_utils import set_device
 
 
 @torch.no_grad()
-def stream_generate(model, tokenizer, prompt, max_new_tokens=500, temperature=0.7, device='cpu'):
+def stream_generate(model, tokenizer, prompt, max_new_tokens=512*2*4, temperature=0.7, device='cpu'):
     model.eval()
     idx = torch.tensor(tokenizer.encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
     
