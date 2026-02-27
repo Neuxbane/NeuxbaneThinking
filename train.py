@@ -12,6 +12,7 @@ import random
 
 dataset_samplings = {
     "claude-4.5-high-reasoning": -1,
+    "dolci_think": -1,
     "stem_reasoning": 0,
 }
 
@@ -251,11 +252,10 @@ def main():
         avg_loss = total_loss / len(dataloader)
         prev_avg_loss = avg_loss
         
-        epoch += 1
+        # Save model after every epoch
+        save_model(model, checkpoint_path)
         
-        # Auto-save every 50 epochs just in case
-        if epoch % 50 == 0:
-            save_model(model, checkpoint_path)
+        epoch += 1
 
 if __name__ == "__main__":
     try:

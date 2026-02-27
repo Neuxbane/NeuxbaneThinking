@@ -212,6 +212,7 @@ class Block(nn.Module):
         
         if config.n_scratchpad > 0:
             # Routing mechanism to pick which scratchpads to use
+            # Input comes from the model's own state at the current position's beginning
             self.router = nn.Linear(config.n_embd, config.num_scratchpads, bias=False)
             
             # Tokens query the scratchpad to "read" from memory
@@ -219,9 +220,9 @@ class Block(nn.Module):
             self.ln_read_sp  = RMSNorm(config.n_embd)
             self.read_attn = CrossAttention(config)
             
-            # Scratchpad queries the tokens to "decide" what to write/update
+            # Scratchpad evolves internally (Self-Attention within memory)
             self.ln_write_sp  = RMSNorm(config.n_embd)
-            self.ln_write_tok = RMSNorm(config.n_embd)
+            self.ln_write_sp_kv = RMSNorm(config.n_embd)
             self.write_attn = CrossAttention(config)
 
             # Gated memory update logic (replaces simple residual)
@@ -238,9 +239,10 @@ class Block(nn.Module):
         
         if scratchpad is not None:
             # Routing: Pick top-2 scratchpad pages based on token representation
-            # We use a summary of tokens (mean) for routing decisions
+            # We use the FIRST token (often BOS or prompt start) for routing 
+            # to avoid future look-ahead/cheating while training on a full sequence.
             B, T, C = x.shape
-            x_summary = x.mean(dim=1)
+            x_summary = x[:, 0] # (B, C) - Context-aware representation of the sequence start
             router_logits = self.router(x_summary) # (B, num_scratchpads)
             
             # Use softmax weights to ensure the router is trainable (MoE style)
@@ -267,9 +269,10 @@ class Block(nn.Module):
             # Tokens are Q, Selected Scratchpad is KV
             x = x + self.read_attn(self.ln_read_tok(x), self.ln_read_sp(flat_sp), self.ln_read_sp(flat_sp))
             
-            # 3. Scratchpad writes from Tokens
-            # Scratchpad is Q, Tokens are KV
-            raw_update = self.write_attn(self.ln_write_sp(flat_sp), self.ln_write_tok(x), self.ln_write_tok(x))
+            # 3. Scratchpad evolves internally (Self-Attention within memory)
+            # It only has access to its own state and previous layers' transformations, NO input tokens from x
+            # This makes the internal brain causal/cheating-proof.
+            raw_update = self.write_attn(self.ln_write_sp(flat_sp), self.ln_write_sp_kv(flat_sp), self.ln_write_sp_kv(flat_sp))
             
             gate = torch.sigmoid(self.sp_gate(torch.cat([flat_sp, raw_update], dim=-1)))
             candidate = torch.tanh(self.sp_update_proj(raw_update))
@@ -351,15 +354,21 @@ class Transformer(nn.Module):
             x = self.transformer.wte(idx) 
             if n_sp > 0:
                 if scratchpad is None:
+                    # Contextualize: provide initial model direction from the first few tokens 
+                    # without allowing any future context during parallel training
+                    topic_seed = x[:, 0:1, :].mean(dim=1, keepdim=True).unsqueeze(1) # (B, 1, 1, C)
                     # Initialize with both base state and slot-specific positional info
                     # Result shape: (B, num_scratchpads, n_scratchpad, n_embd)
                     scratchpad = (self.scratchpad_init + self.scratchpad_pos).unsqueeze(0).expand(b, -1, -1, -1)
+                    scratchpad = scratchpad + topic_seed # Broadcast context to internal brain
             kv_caches = [None] * len(self.transformer.h)
         else:
             # Incremental generation pass
             x = self.transformer.wte(idx)
             if n_sp > 0 and scratchpad is None:
+                topic_seed = x[:, 0:1, :].mean(dim=1, keepdim=True).unsqueeze(1)
                 scratchpad = (self.scratchpad_init + self.scratchpad_pos).unsqueeze(0).expand(b, -1, -1, -1)
+                scratchpad = scratchpad + topic_seed
 
         new_kv_caches = []
         for i, block in enumerate(self.transformer.h):

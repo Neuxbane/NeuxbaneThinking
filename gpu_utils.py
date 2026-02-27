@@ -206,29 +206,36 @@ def reserve_gpu_memory(target_gb=8.0, gpu_idx=None, wait_interval=5):
                     torch.cuda.empty_cache()
                     break # Back to outer loop to find a healthy GPU
 
-                # Normal Aggregation Logic
-                if current_sum_gb < target_gb:
-                    # Check how much is currently free
-                    try:
-                        # Use already fetched info
-                        current_free = target_data[1]
+                # Normal Aggregation Logic: Inner polling for faster acquisition as requested.
+                if current_sum_gb < (target_gb * 0.99):
+                    while True:
+                        info = get_gpu_memory_info()
+                        target_data = next((g for g in info if g[0] == idx), None)
+                        if not target_data or target_data[4]: break
                         
-                        # Grab whatever is free, leaving a 100MB buffer for system stability
-                        to_grab = min(current_free - 0.1, target_gb - current_sum_gb)
-                        if to_grab > 0.05: # At least 50MB chunks
-                            num_elements = int((to_grab * 0.98 * (1024**3)) / 4)
-                            block = torch.zeros((num_elements,), device=device, dtype=torch.float32)
-                            reserved_blocks.append(block)
-                            current_sum_gb += (to_grab * 0.98)
-                            
-                            # Update lock file
-                            with open(lock_file, 'w') as f:
-                                f.write(f"{os.getpid()}:{idx}:{current_sum_gb:.2f}")
-                            print(f"  [GPU {idx}] Aggregated block: {to_grab * 0.98:.2f} GB | Total: {current_sum_gb:.2f}/{target_gb:.2f}")
-                    except Exception:
-                        pass # nvidia-smi spike?
-
-                time.sleep(2)
+                        current_free = target_data[1]
+                        needed_gb = target_gb - current_sum_gb
+                        if needed_gb <= 0.01: break
+                        
+                        # Grab small safe chunks
+                        to_grab = min(0.5, current_free - 0.1, needed_gb)
+                        if to_grab > 0.02:
+                            try:
+                                num_els = int((to_grab * 0.98 * (1024**3)) / 4)
+                                block = torch.zeros((num_els,), device=device, dtype=torch.float32)
+                                reserved_blocks.append(block)
+                                current_sum_gb += (to_grab * 0.98)
+                                with open(lock_file, 'w') as f:
+                                    f.write(f"{os.getpid()}:{idx}:{current_sum_gb:.2f}")
+                                
+                                sys.stdout.write(f"\r  [GPU {idx}] Reservation: {current_sum_gb:.2f}/{target_gb:.2f} GB ({int(current_sum_gb/target_gb*100)}%) | Effective: {current_free + current_sum_gb:.2f} GB    ")
+                                sys.stdout.flush()
+                            except:
+                                torch.cuda.empty_cache()
+                                break # Exit inner grab loop
+                        else: break # No more free memory to grab right now
+                
+                time.sleep(0.5) # Polling interval for next block aggregation loop iteration
             
             # If we broke the inner loop because of a handover
             continue
@@ -315,73 +322,98 @@ def get_best_device(min_memory_gb=2.0, release_reserved=True):
         # Or if we strictly don't have enough even with reservation, try clearing all anyway just in case
         force_clean = release_reserved and (best_effective_free < min_memory_gb)
         
-        if needs_release or (force_clean and user_reservations):
-            print(f"Triggering Handover Request on GPU {best_gpu_idx} to meet {min_memory_gb:.2f} GB requirement...")
-            signaled_pids = release_any_reservations(best_gpu_idx if needs_release else None)
-            
-            # PROTECTIVE AGGREGATION: Grab memory as soon as it releases to prevent others from stealing it
-            print(f"Securing {min_memory_gb:.2f} GB by protective aggregation...")
-            captured_blocks = []
-            captured_gb = 0
-            device_securing = torch.device(f'cuda:{best_gpu_idx}')
-            
-            max_retries = 40 # 20 seconds total wait
-            for i in range(max_retries):
-                needed_gb = min_memory_gb - (captured_gb * 0.95) # allow for small rounding
-                if needed_gb <= 0:
-                    break
-                    
-                # Refresh status
-                info_now, _ = get_status()
-                target_gpu = next((g for g in info_now if g[0] == best_gpu_idx), None)
-                
-                if target_gpu:
-                    real_free = target_gpu[1]
-                    # Attempt to grab a chunk if at least 100MB is free
-                    to_grab = min(real_free - 0.05, needed_gb)
-                    if to_grab > 0.05:
-                        try:
-                            num_els = int((to_grab * 0.98 * (1024**3)) / 4)
-                            # Secure the memory for THIS process
-                            block = torch.zeros((num_els,), device=device_securing, dtype=torch.float32)
-                            captured_blocks.append(block)
-                            captured_gb += (to_grab * 0.98)
-                            print(f"  Secured chunk: {to_grab * 0.98:.2f} GB | Local Total: {captured_gb:.2f}/{min_memory_gb:.2f}")
-                        except torch.cuda.OutOfMemoryError:
-                            torch.cuda.empty_cache()
-                
-                time.sleep(0.5)
+        # Always attempt a protective aggregation step to consolidate free memory
+        # on the chosen GPU before returning it. If reservations exist and we are
+        # allowed to release them, signal them first; otherwise just attempt to
+        # secure memory directly. This reduces race conditions where freed
+        # memory is immediately taken by another process.
+        # 2. Decision Logic Support
+        # In Dashboard mode (release_reserved=False), we skip protective aggregation 
+        # as we are just reporting state. In Active mode, we secure the slot.
+        if not release_reserved:
+            print("Dashboard check: skipping protective aggregation.")
+        else:
+            signaled_pids = []
+            if needs_release or (force_clean and user_reservations):
+                print(f"Triggering Handover Request on GPU {best_gpu_idx} to meet {min_memory_gb:.2f} GB requirement...")
+                signaled_pids = release_any_reservations(best_gpu_idx if needs_release else None)
 
-            # Inform reserver that we've secured what we need
+            print(f"Securing {min_memory_gb:.2f} GB by protective aggregation (attempt)...")
+            captured_blocks = []
+            captured_gb = 0.0
+            device_securing = torch.device(f'cuda:{best_gpu_idx}')
+
+            # Refactored aggregation: Infinite outer loop with nested polling and \r display feedback.
+            import sys
+            try:
+                while captured_gb < (min_memory_gb * 0.98):
+                    info_now, _ = get_status()
+                    target_gpu = next((g for g in info_now if g[0] == best_gpu_idx), None)
+
+                    if target_gpu:
+                        real_free = target_gpu[1]
+                        # Inner polling loop to grab all currently available memory bits immediately
+                        while real_free > 0.1:
+                            needed_gb = min_memory_gb - captured_gb
+                            if needed_gb <= 0.01: break
+                            
+                            to_grab = min(0.5, real_free - 0.05, needed_gb)
+                            if to_grab > 0.02:
+                                try:
+                                    num_els = int((to_grab * 0.98 * (1024**3)) / 4)
+                                    block = torch.zeros((num_els,), device=device_securing, dtype=torch.float32)
+                                    captured_blocks.append(block)
+                                    captured_gb += (to_grab * 0.98)
+                                    status = f"\r  [GPU {best_gpu_idx}] Consolidating: {captured_gb:.2f}/{min_memory_gb:.2f} GB ({int(captured_gb/min_memory_gb*100)}%) | Effective: {real_free + captured_gb:.2f} GB    "
+                                    sys.stdout.write(status)
+                                    sys.stdout.flush()
+                                    
+                                    # Refresh stats for next inner iteration
+                                    info_now, _ = get_status()
+                                    target_gpu = next((g for g in info_now if g[0] == best_gpu_idx), None)
+                                    real_free = target_gpu[1] if target_gpu else 0
+                                except:
+                                    torch.cuda.empty_cache()
+                                    break
+                            else: break
+                    
+                    if captured_gb >= (min_memory_gb * 0.98): break
+                    time.sleep(0.5)
+                print() # End \r line
+            except KeyboardInterrupt:
+                print("\nAggregation stopped by user.")
+                print() # To clear space for following messages
+
+            # If we were signaling others, inform them we secured memory
             if captured_gb >= (min_memory_gb * 0.8) and signaled_pids:
                 print(f"✓ Memory successfully consolidated ({captured_gb:.2f} GB). Sending Handover OK.")
                 for pid in signaled_pids:
                     try:
-                        os.kill(pid, signal.SIGUSR2) # SIGUSR2 = OK I got it
-                    except ProcessLookupError: pass
+                        os.kill(pid, signal.SIGUSR2)
+                    except ProcessLookupError:
+                        pass
             else:
-                print(f"! Failed to consolidate full requirement. Got {captured_gb:.2f} GB. Moving forward anyway...")
+                print(f"! Protective aggregation result: {captured_gb:.2f} GB (moving forward)")
 
             # Clean up our protective blocks so the main script can use the memory
             del captured_blocks
             torch.cuda.empty_cache()
-            time.sleep(1.0) # Give nvidia-smi a bit more time to refresh
-            
-            # Final refresh
+            time.sleep(1.0)
+
+            # Final refresh and update of perceived free memory
             gpu_info_final, _ = get_status()
             target_gpu = next((g for g in gpu_info_final if g[0] == best_gpu_idx), None)
             if target_gpu:
-                # CRITICAL: Trust our own consolidation result over a potentially stale nvidia-smi poll.
-                # If we successfully allocated 4.2GB in this process, we KNOW it is available now.
                 best_real_free = max(target_gpu[1], captured_gb)
-                best_effective_free = best_real_free 
+                best_effective_free = best_real_free
 
     # 3. Final Selection
     # For decision making: if we didn't release, use best_effective_free to allow dashboard 
     # to show what is POSSIBLE with the reservation.
     actual_decision_VRAM = best_real_free if release_reserved else best_effective_free
 
-    if best_gpu_idx is not None and actual_decision_VRAM >= min_memory_gb:
+    # Use a larger epsilon (50MB) for comparison to handle rounding/precision in dashboard reports
+    if best_gpu_idx is not None and actual_decision_VRAM >= (min_memory_gb - 0.05):
         # Initial device using global index
         device = torch.device(f'cuda:{best_gpu_idx}')
         
