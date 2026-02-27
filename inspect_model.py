@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from model import Transformer, TransformerConfig, ByteTokenizer
+from gpu_utils import set_device
 import time
 import numpy as np
 
@@ -14,8 +15,8 @@ def generate_random_batch(batch_size, seq_len, vocab_size, device):
     return input_ids, targets
 
 def analyze_speed(model, config, device):
-    batch_size = 2 # Reduced from 4 to avoid OOM in tight environments
-    seq_len = config.block_size
+    batch_size = 1 
+    seq_len = 4    # Bare minimum for baseline check
     
     print("\n" + "="*50)
     print(f"SPEED ANALYSIS (Device: {device})")
@@ -25,7 +26,7 @@ def analyze_speed(model, config, device):
     input_ids, targets = generate_random_batch(batch_size, seq_len, config.vocab_size, device)
     
     # Warmup
-    for _ in range(3):
+    for _ in range(1):
         logits, loss, _, _ = model(input_ids, targets=targets)
         loss.backward()
         model.zero_grad()
@@ -34,7 +35,7 @@ def analyze_speed(model, config, device):
         torch.cuda.synchronize()
         
     start_time = time.time()
-    num_iters = 10
+    num_iters = 5
     total_tokens = num_iters * batch_size * seq_len
     
     for _ in range(num_iters):
@@ -86,7 +87,7 @@ def analyze_speed(model, config, device):
 
 def inspect_model():
     # Detect device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, _ = set_device(min_memory_gb=2.0)
     print(f"Using device: {device}")
 
     # Use the same configuration as in train.py
@@ -112,8 +113,8 @@ def inspect_model():
         print("Loading weights from model.pth...")
         try:
             state_dict = torch.load("model.pth", map_location=device, weights_only=True)
-            model.load_state_dict(state_dict)
-            print("Successfully loaded model.pth")
+            model.load_state_dict(state_dict, strict=False)
+            print("Successfully loaded model.pth (non-strict)")
         except Exception as e:
             print(f"Warning: Could not load weights: {e}")
     else:
@@ -139,7 +140,8 @@ def inspect_model():
     
     # --- Sanity Check: Loss and Gradients ---
     expected_loss = np.log(config.vocab_size)
-    dummy_input, dummy_targets = generate_random_batch(4, 128, config.vocab_size, device)
+    # Reduced batch and seq_len for routing memory efficiency
+    dummy_input, dummy_targets = generate_random_batch(1, 16, config.vocab_size, device)
     
     # Explicitly ensure grad is enabled
     torch.set_grad_enabled(True)

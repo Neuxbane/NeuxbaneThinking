@@ -12,8 +12,8 @@ import random
 
 dataset_samplings = {
     "claude-4.5-high-reasoning": -1,
-    "dolci_think": -1,
-    "stem_reasoning": 0,
+    # "dolci_think": -1,
+    # "stem_reasoning": 0,
 }
 
 # --- Dataset ---
@@ -202,7 +202,7 @@ def main():
 
     # Now that data is loaded, select the device and move model there. This
     # prevents holding GPU resources while parsing/loading datasets.
-    device, device_name = set_device(min_memory_gb=4.0)
+    device, device_name = set_device(min_memory_gb=6.0)
     print(f"Using device: {device_name}")
 
     # Move model to chosen device
